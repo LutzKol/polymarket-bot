@@ -76,14 +76,20 @@ async def export_loop(
                 break
 
             snapshot = runner.state.snapshot(seconds_remaining=seconds_remaining)
-            features = extractor.extract(snapshot)
 
             oracle_prices = snapshot.get("oracle_prices", [])
             spot_prices = snapshot.get("spot_prices", [])
             round_ids = snapshot.get("oracle_round_ids", [])
 
-            oracle_price = oracle_prices[-1] if oracle_prices else None
-            spot_price = spot_prices[-1] if spot_prices else None
+            # Skip export until we have at least one oracle AND spot price
+            if not oracle_prices or not spot_prices:
+                await asyncio.sleep(export_interval)
+                continue
+
+            features = extractor.extract(snapshot)
+
+            oracle_price = oracle_prices[-1]
+            spot_price = spot_prices[-1]
             round_id = round_ids[-1] if round_ids else None
 
             row = [

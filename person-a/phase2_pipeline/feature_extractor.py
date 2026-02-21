@@ -105,7 +105,7 @@ class FeatureExtractor:
         sigma_long = _calc_ewma_sigma(spot_prices, lam=0.97)
 
         sigma_ratio = None
-        if sigma_short is not None and sigma_long not in (None, 0.0):
+        if sigma_short is not None and sigma_long is not None and sigma_long != 0.0:
             sigma_ratio = sigma_short / sigma_long
 
         pm_orderbook = snapshot.get("polymarket_orderbook", {})
