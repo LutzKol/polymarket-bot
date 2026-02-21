@@ -1,0 +1,14 @@
+{
+    "polygon_rpc_url": "https://polygon-mainnet.g.alchemy.com/v2/Ix3V5IAZIZLQFRbS1yRN-",
+    "chainlink_address": "0xc907E116054Ad103354f2D350FD2514433D57F6f",
+    "alert_threshold_pct": 0.35,
+    "oracle_poll_seconds": 5,
+    "polymarket_base_url": "https://clob.polymarket.com",
+    "polymarket_token_id": "",
+    "polymarket_poll_seconds": 1,
+    "funding_enabled": true,
+    "funding_symbol": "BTCUSDT",
+    "funding_base_url": "https://fapi.binance.com",
+    "funding_poll_seconds": 30,
+    "log_file": "oracle_lag_log.csv"
+}

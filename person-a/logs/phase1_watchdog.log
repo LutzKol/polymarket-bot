@@ -1,0 +1,9 @@
+[2026-02-21T10:41:56Z] Watchdog gestartet (interval=60s)
+[2026-02-21T10:41:56Z] Monitor nicht aktiv -> starte neu
+Started Phase 1 monitor
+- PID: 24908
+- Log: logs/phase1_monitor_20260221T104156Z.log
+- CSV: oracle_lag_log.csv
+[2026-02-21T10:41:56Z] status=RESTARTED rows=1286 restarts=1 no_growth_cycles=0
+[2026-02-21T10:42:33Z] Watchdog gestartet (interval=60s)
+[2026-02-21T10:42:33Z] status=EXTERNAL_ACTIVE rows=1300 restarts=0 no_growth_cycles=0

@@ -1,0 +1,22 @@
+/Users/s1/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+
+[1m[94m═════════════════════════════════════════════════════════════════
+  🔍  ORACLE LAG MONITOR  —  PHASE 1
+  Chainlink BTC/USD (Polygon) vs. Binance Spot
+  Alert-Schwelle: ±0.35%  |  Oracle-Poll: alle 5s
+  Log-Datei: oracle_lag_log.csv
+═════════════════════════════════════════════════════════════════[0m
+
+[92m[NTP] ✓ Zeitsynchronisation gemessen  (Offset: +0.0104s)[0m
+[92m[Web3] ✓ Polygon Mainnet verbunden  (Block #83,273,332)[0m
+[92m[Oracle] ✓ Chainlink BTC/USD erreichbar  ($68,128.33  Round #55340232221131972807)[0m
+[96m[Info] Starte Monitoring... (CTRL+C zum Stoppen)[0m
+
+─────────────────────────────────────────────────────────────────
+Timestamp                    Oracle         Spot         Lag  Round
+─────────────────────────────────────────────────────────────────
+[94m[Oracle] Starte Polygon Verbindung...[0m
+[92m[Binance] Verbinde WebSocket...[0m
+[92m[Binance] ✓ Verbunden — Empfange BTC/USDT Preise[0m
+
