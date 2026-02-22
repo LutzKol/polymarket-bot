@@ -4,8 +4,11 @@
     "alert_threshold_pct": 0.35,
     "oracle_poll_seconds": 5,
     "polymarket_base_url": "https://clob.polymarket.com",
+    "polymarket_gamma_base_url": "https://gamma-api.polymarket.com",
     "polymarket_token_id": "",
+    "polymarket_auto_rotate": true,
     "polymarket_poll_seconds": 1,
+    "polymarket_rotate_check_seconds": 15,
     "funding_enabled": true,
     "funding_symbol": "BTCUSDT",
     "funding_base_url": "https://fapi.binance.com",
@@ -21,4 +24,13 @@
     "brier_gate": 0.24,
     "max_consecutive_losses": 3,
     "signal_csv_path": "data/trade_signals.csv"
+    ,
+    "trade_alerts_enabled": true,
+    "trade_alert_provider": "telegram",
+    "discord_webhook_url": "",
+    "telegram_bot_token": "8221519246:AAGQaZOnJhqOerYoXKgDKAXrmWtIZaqSGlY",
+    "telegram_chat_id": "-5194389201",
+    "trade_alert_only_actionable": true,
+    "trade_alert_min_interval_seconds": 30,
+    "trade_alert_dedupe_by_bucket": true
 }

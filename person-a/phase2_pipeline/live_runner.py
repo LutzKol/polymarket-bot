@@ -33,7 +33,8 @@ try:
     from phase2_pipeline.feature_normalizer import FeatureNormalizer
     from phase2_pipeline.features import calculate_obi
     from phase2_pipeline.funding_client import FundingRatePoller
-    from phase2_pipeline.polymarket_client import PolymarketBookPoller
+    from phase2_pipeline.polymarket_client import PolymarketBookPoller, RotatingPolymarketBookPoller
+    from phase2_pipeline.signal_alerts import SignalAlertConfig, SignalAlertNotifier
     from phase2_pipeline.state_store import UnifiedStateStore
     from phase2_pipeline.time_utils import seconds_remaining_in_5m_window
     from phase2_pipeline.trade_signal import TradeSignal
@@ -53,7 +54,8 @@ except ModuleNotFoundError:
     from phase2_pipeline.feature_normalizer import FeatureNormalizer
     from phase2_pipeline.features import calculate_obi
     from phase2_pipeline.funding_client import FundingRatePoller
-    from phase2_pipeline.polymarket_client import PolymarketBookPoller
+    from phase2_pipeline.polymarket_client import PolymarketBookPoller, RotatingPolymarketBookPoller
+    from phase2_pipeline.signal_alerts import SignalAlertConfig, SignalAlertNotifier
     from phase2_pipeline.state_store import UnifiedStateStore
     from phase2_pipeline.time_utils import seconds_remaining_in_5m_window
     from phase2_pipeline.trade_signal import TradeSignal
@@ -92,6 +94,9 @@ class Phase2LiveRunner:
         polymarket_token_id: Optional[str] = None,
         polymarket_poll_seconds: float = 1.0,
         polymarket_base_url: str = "https://clob.polymarket.com",
+        polymarket_gamma_base_url: str = "https://gamma-api.polymarket.com",
+        polymarket_auto_rotate: bool = False,
+        polymarket_rotate_check_seconds: float = 15.0,
         funding_enabled: bool = True,
         funding_symbol: str = "BTCUSDT",
         funding_poll_seconds: float = 30.0,
@@ -106,6 +111,14 @@ class Phase2LiveRunner:
         brier_gate: float = 0.24,
         max_consecutive_losses: int = 3,
         signal_csv_path: str = "data/trade_signals.csv",
+        trade_alerts_enabled: bool = False,
+        trade_alert_provider: str = "",
+        discord_webhook_url: str = "",
+        telegram_bot_token: str = "",
+        telegram_chat_id: str = "",
+        trade_alert_only_actionable: bool = True,
+        trade_alert_min_interval_seconds: float = 30.0,
+        trade_alert_dedupe_by_bucket: bool = True,
     ):
         self.oracle_poll_seconds = oracle_poll_seconds
         self.heartbeat_seconds = heartbeat_seconds
@@ -137,6 +150,14 @@ class Phase2LiveRunner:
                 poll_seconds=polymarket_poll_seconds,
                 logger=self._log,
             )
+        elif polymarket_auto_rotate:
+            self.polymarket_poller = RotatingPolymarketBookPoller(
+                base_url=polymarket_base_url,
+                gamma_base_url=polymarket_gamma_base_url,
+                poll_seconds=polymarket_poll_seconds,
+                rotate_check_seconds=polymarket_rotate_check_seconds,
+                logger=self._log,
+            )
 
         self.funding_poller: Optional[FundingRatePoller] = None
         if funding_enabled:
@@ -151,6 +172,20 @@ class Phase2LiveRunner:
         self.ev_enabled = False
         self.bankroll_usdc = bankroll_usdc
         self.signal_csv_path = signal_csv_path
+        self.signal_alert_notifier: Optional[SignalAlertNotifier] = None
+        alert_cfg = SignalAlertConfig(
+            enabled=bool(trade_alerts_enabled),
+            provider=str(trade_alert_provider or ""),
+            discord_webhook_url=str(discord_webhook_url or ""),
+            telegram_bot_token=str(telegram_bot_token or ""),
+            telegram_chat_id=str(telegram_chat_id or ""),
+            actionable_only=bool(trade_alert_only_actionable),
+            min_interval_seconds=float(trade_alert_min_interval_seconds),
+            dedupe_by_bucket=bool(trade_alert_dedupe_by_bucket),
+        )
+        _alert_notifier = SignalAlertNotifier(alert_cfg)
+        if _alert_notifier.is_enabled():
+            self.signal_alert_notifier = _alert_notifier
 
         if model_path:
             try:
@@ -194,6 +229,18 @@ class Phase2LiveRunner:
             row = signal.to_dict()
             writer.writerow([row[col] for col in TradeSignal.csv_columns()])
             f.flush()
+
+    async def _maybe_alert_signal(self, signal: TradeSignal) -> None:
+        if self.signal_alert_notifier is None:
+            return
+        try:
+            sent, reason = await asyncio.to_thread(self.signal_alert_notifier.notify, signal)
+            if sent:
+                self._log(f"[ALERT] sent ({self.signal_alert_notifier.config.provider})")
+            elif reason not in {"not_actionable", "duplicate_bucket", "throttled"}:
+                self._log(f"[ALERT] skipped ({reason})")
+        except Exception as exc:
+            self._log(f"[ALERT] error: {exc}")
 
     def _fetch_oracle_blocking(self) -> tuple[int, float, int]:
         raw = self.chainlink_contract.functions.latestRoundData().call()
@@ -302,6 +349,7 @@ class Phase2LiveRunner:
                         oracle_stale=oracle_stale,
                     )
                     self._log_signal(signal)
+                    await self._maybe_alert_signal(signal)
                     self._log(
                         f"[EV] dir={signal.direction} p_model={signal.model_probability:.4f} "
                         f"p_mkt={signal.market_probability:.4f} ev={signal.ev:.4f} "
@@ -365,6 +413,16 @@ class Phase2LiveRunner:
         else:
             self._log("[EV] EV Engine disabled (no model_path)")
 
+        if self.signal_alert_notifier is not None:
+            cfg = self.signal_alert_notifier.config
+            self._log(
+                "[ALERT] enabled "
+                f"(provider={cfg.provider}, actionable_only={cfg.actionable_only}, "
+                f"min_interval={cfg.min_interval_seconds}s, dedupe_by_bucket={cfg.dedupe_by_bucket})"
+            )
+        else:
+            self._log("[ALERT] disabled")
+
         feeds = [
             FeedConfig(
                 name="binance_ticker",
@@ -390,7 +448,10 @@ class Phase2LiveRunner:
         ]
         if self.polymarket_poller is not None:
             tasks.append(self.polymarket_poller.run(self._get_stop_event(), self.on_polymarket_book))
-            self._log("[PM] enabled (REST poller)")
+            if isinstance(self.polymarket_poller, RotatingPolymarketBookPoller):
+                self._log("[PM] enabled (REST poller, dynamic token rotation)")
+            else:
+                self._log("[PM] enabled (REST poller)")
         else:
             self._log("[PM] disabled (set polymarket_token_id in config to enable)")
 
@@ -422,12 +483,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heartbeat-seconds", type=float, default=1.0, help="Console heartbeat interval")
     parser.add_argument("--history-size", type=int, default=1800, help="State history size")
     parser.add_argument("--polymarket-token-id", default=None, help="Polymarket token id for /book polling")
+    parser.add_argument(
+        "--polymarket-auto-rotate",
+        type=str,
+        default=None,
+        help="Auto-discover/rotate BTC 5m Polymarket token via Gamma API (true/false)",
+    )
     parser.add_argument("--polymarket-poll-seconds", type=float, default=None, help="Polymarket poll interval")
     parser.add_argument("--polymarket-base-url", default=None, help="Polymarket CLOB base URL")
+    parser.add_argument("--polymarket-gamma-base-url", default=None, help="Polymarket Gamma API base URL")
+    parser.add_argument(
+        "--polymarket-rotate-check-seconds",
+        type=float,
+        default=None,
+        help="How often to re-resolve dynamic BTC 5m token",
+    )
     parser.add_argument("--funding-enabled", type=str, default=None, help="Enable funding poller: true/false")
     parser.add_argument("--funding-symbol", default=None, help="Funding symbol, e.g. BTCUSDT")
     parser.add_argument("--funding-poll-seconds", type=float, default=None, help="Funding poll interval")
     parser.add_argument("--funding-base-url", default=None, help="Funding API base URL")
+    parser.add_argument("--trade-alerts-enabled", type=str, default=None, help="Enable trade alerts: true/false")
+    parser.add_argument("--trade-alert-provider", default=None, help="discord or telegram")
+    parser.add_argument("--discord-webhook-url", default=None, help="Discord webhook URL")
+    parser.add_argument("--telegram-bot-token", default=None, help="Telegram bot token")
+    parser.add_argument("--telegram-chat-id", default=None, help="Telegram chat ID")
+    parser.add_argument(
+        "--trade-alert-only-actionable",
+        type=str,
+        default=None,
+        help="Send only actionable trade suggestions: true/false",
+    )
+    parser.add_argument(
+        "--trade-alert-min-interval-seconds",
+        type=float,
+        default=None,
+        help="Minimum seconds between alerts",
+    )
+    parser.add_argument(
+        "--trade-alert-dedupe-by-bucket",
+        type=str,
+        default=None,
+        help="Dedupe alerts per 5m bucket+direction: true/false",
+    )
     parser.add_argument(
         "--duration-seconds",
         type=float,
@@ -472,6 +569,24 @@ def main() -> int:
         if args.polymarket_base_url is not None
         else str(config.get("polymarket_base_url", "https://clob.polymarket.com"))
     )
+    polymarket_gamma_base_url = (
+        args.polymarket_gamma_base_url
+        if args.polymarket_gamma_base_url is not None
+        else str(config.get("polymarket_gamma_base_url", "https://gamma-api.polymarket.com"))
+    )
+    polymarket_auto_rotate = bool(config.get("polymarket_auto_rotate", False))
+    if args.polymarket_auto_rotate is not None:
+        polymarket_auto_rotate = str(args.polymarket_auto_rotate).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    polymarket_rotate_check_seconds = (
+        args.polymarket_rotate_check_seconds
+        if args.polymarket_rotate_check_seconds is not None
+        else float(config.get("polymarket_rotate_check_seconds", 15.0))
+    )
 
     funding_enabled = config.get("funding_enabled", True)
     if args.funding_enabled is not None:
@@ -487,6 +602,50 @@ def main() -> int:
         if args.funding_base_url is not None
         else str(config.get("funding_base_url", "https://fapi.binance.com"))
     )
+    trade_alerts_enabled = bool(config.get("trade_alerts_enabled", False))
+    if args.trade_alerts_enabled is not None:
+        trade_alerts_enabled = str(args.trade_alerts_enabled).strip().lower() in {"1", "true", "yes", "on"}
+    trade_alert_provider = (
+        args.trade_alert_provider
+        if args.trade_alert_provider is not None
+        else str(config.get("trade_alert_provider", ""))
+    )
+    discord_webhook_url = (
+        args.discord_webhook_url
+        if args.discord_webhook_url is not None
+        else str(config.get("discord_webhook_url", ""))
+    )
+    telegram_bot_token = (
+        args.telegram_bot_token
+        if args.telegram_bot_token is not None
+        else str(config.get("telegram_bot_token", ""))
+    )
+    telegram_chat_id = (
+        args.telegram_chat_id
+        if args.telegram_chat_id is not None
+        else str(config.get("telegram_chat_id", ""))
+    )
+    trade_alert_only_actionable = bool(config.get("trade_alert_only_actionable", True))
+    if args.trade_alert_only_actionable is not None:
+        trade_alert_only_actionable = str(args.trade_alert_only_actionable).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    trade_alert_min_interval_seconds = (
+        args.trade_alert_min_interval_seconds
+        if args.trade_alert_min_interval_seconds is not None
+        else float(config.get("trade_alert_min_interval_seconds", 30.0))
+    )
+    trade_alert_dedupe_by_bucket = bool(config.get("trade_alert_dedupe_by_bucket", True))
+    if args.trade_alert_dedupe_by_bucket is not None:
+        trade_alert_dedupe_by_bucket = str(args.trade_alert_dedupe_by_bucket).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     # Phase 4: EV-Engine config
     model_path = str(config.get("model_path", ""))
@@ -503,6 +662,9 @@ def main() -> int:
         polymarket_token_id=polymarket_token_id,
         polymarket_poll_seconds=polymarket_poll_seconds,
         polymarket_base_url=polymarket_base_url,
+        polymarket_gamma_base_url=polymarket_gamma_base_url,
+        polymarket_auto_rotate=polymarket_auto_rotate,
+        polymarket_rotate_check_seconds=polymarket_rotate_check_seconds,
         funding_enabled=bool(funding_enabled),
         funding_symbol=funding_symbol,
         funding_poll_seconds=funding_poll_seconds,
@@ -517,6 +679,14 @@ def main() -> int:
         brier_gate=float(config.get("brier_gate", 0.24)),
         max_consecutive_losses=int(config.get("max_consecutive_losses", 3)),
         signal_csv_path=str(config.get("signal_csv_path", "data/trade_signals.csv")),
+        trade_alerts_enabled=trade_alerts_enabled,
+        trade_alert_provider=trade_alert_provider,
+        discord_webhook_url=discord_webhook_url,
+        telegram_bot_token=telegram_bot_token,
+        telegram_chat_id=telegram_chat_id,
+        trade_alert_only_actionable=trade_alert_only_actionable,
+        trade_alert_min_interval_seconds=trade_alert_min_interval_seconds,
+        trade_alert_dedupe_by_bucket=trade_alert_dedupe_by_bucket,
     )
 
     try:

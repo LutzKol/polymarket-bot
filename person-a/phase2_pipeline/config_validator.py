@@ -9,8 +9,11 @@ DEFAULTS = {
     "oracle_poll_seconds": 5.0,
     "alert_threshold_pct": 0.35,
     "polymarket_base_url": "https://clob.polymarket.com",
+    "polymarket_gamma_base_url": "https://gamma-api.polymarket.com",
     "polymarket_token_id": "",
+    "polymarket_auto_rotate": False,
     "polymarket_poll_seconds": 1.0,
+    "polymarket_rotate_check_seconds": 15.0,
     "funding_enabled": True,
     "funding_symbol": "BTCUSDT",
     "funding_base_url": "https://fapi.binance.com",
@@ -26,29 +29,50 @@ DEFAULTS = {
     "brier_gate": 0.24,
     "max_consecutive_losses": 3,
     "signal_csv_path": "data/trade_signals.csv",
+    # Trade signal alerts (Discord / Telegram)
+    "trade_alerts_enabled": False,
+    "trade_alert_provider": "",
+    "discord_webhook_url": "",
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    "trade_alert_only_actionable": True,
+    "trade_alert_min_interval_seconds": 30.0,
+    "trade_alert_dedupe_by_bucket": True,
 }
 
 FLOAT_FIELDS = {
     "oracle_poll_seconds",
     "alert_threshold_pct",
     "polymarket_poll_seconds",
+    "polymarket_rotate_check_seconds",
     "funding_poll_seconds",
     "max_oracle_age_seconds",
     "bankroll_usdc",
     "max_fraction_per_trade",
     "ev_threshold",
     "brier_gate",
+    "trade_alert_min_interval_seconds",
 }
 
 POSITIVE_FLOAT_FIELDS = {
     "oracle_poll_seconds",
     "alert_threshold_pct",
     "polymarket_poll_seconds",
+    "polymarket_rotate_check_seconds",
     "funding_poll_seconds",
     "max_oracle_age_seconds",
     "bankroll_usdc",
     "max_fraction_per_trade",
     "ev_threshold",
+    "trade_alert_min_interval_seconds",
+}
+
+BOOL_FIELDS = {
+    "polymarket_auto_rotate",
+    "funding_enabled",
+    "trade_alerts_enabled",
+    "trade_alert_only_actionable",
+    "trade_alert_dedupe_by_bucket",
 }
 
 
@@ -81,5 +105,21 @@ def validate_config(config: dict) -> dict:
     for key in POSITIVE_FLOAT_FIELDS:
         if key in result and result[key] <= 0:
             raise ValueError(f"config key {key!r} must be > 0, got {result[key]}")
+
+    for key in BOOL_FIELDS:
+        if key not in result:
+            continue
+        value = result[key]
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                result[key] = True
+                continue
+            if lowered in {"0", "false", "no", "off"}:
+                result[key] = False
+                continue
+        raise ValueError(f"config key {key!r} must be boolean, got {value!r}")
 
     return result

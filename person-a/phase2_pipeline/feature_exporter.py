@@ -138,8 +138,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--oracle-poll-seconds", type=float, default=None, help="Oracle poll interval override")
     parser.add_argument("--history-size", type=int, default=1800, help="State history size")
     parser.add_argument("--polymarket-token-id", default=None, help="Polymarket token id for /book polling")
+    parser.add_argument(
+        "--polymarket-auto-rotate",
+        type=str,
+        default=None,
+        help="Auto-discover/rotate BTC 5m Polymarket token via Gamma API (true/false)",
+    )
     parser.add_argument("--polymarket-poll-seconds", type=float, default=None, help="Polymarket poll interval")
     parser.add_argument("--polymarket-base-url", default=None, help="Polymarket CLOB base URL")
+    parser.add_argument("--polymarket-gamma-base-url", default=None, help="Polymarket Gamma API base URL")
+    parser.add_argument(
+        "--polymarket-rotate-check-seconds",
+        type=float,
+        default=None,
+        help="How often to re-resolve dynamic BTC 5m token",
+    )
     parser.add_argument("--funding-enabled", type=str, default=None, help="Enable funding poller: true/false")
     parser.add_argument("--funding-symbol", default=None, help="Funding symbol, e.g. BTCUSDT")
     parser.add_argument("--funding-poll-seconds", type=float, default=None, help="Funding poll interval")
@@ -174,6 +187,24 @@ def main() -> int:
         if args.polymarket_base_url is not None
         else str(config.get("polymarket_base_url", "https://clob.polymarket.com"))
     )
+    polymarket_gamma_base_url = (
+        args.polymarket_gamma_base_url
+        if args.polymarket_gamma_base_url is not None
+        else str(config.get("polymarket_gamma_base_url", "https://gamma-api.polymarket.com"))
+    )
+    polymarket_auto_rotate = bool(config.get("polymarket_auto_rotate", False))
+    if args.polymarket_auto_rotate is not None:
+        polymarket_auto_rotate = str(args.polymarket_auto_rotate).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    polymarket_rotate_check_seconds = (
+        args.polymarket_rotate_check_seconds
+        if args.polymarket_rotate_check_seconds is not None
+        else float(config.get("polymarket_rotate_check_seconds", 15.0))
+    )
     funding_enabled = config.get("funding_enabled", True)
     if args.funding_enabled is not None:
         funding_enabled = str(args.funding_enabled).strip().lower() in {"1", "true", "yes", "on"}
@@ -198,6 +229,9 @@ def main() -> int:
         polymarket_token_id=polymarket_token_id,
         polymarket_poll_seconds=polymarket_poll_seconds,
         polymarket_base_url=polymarket_base_url,
+        polymarket_gamma_base_url=polymarket_gamma_base_url,
+        polymarket_auto_rotate=polymarket_auto_rotate,
+        polymarket_rotate_check_seconds=polymarket_rotate_check_seconds,
         funding_enabled=bool(funding_enabled),
         funding_symbol=funding_symbol,
         funding_poll_seconds=funding_poll_seconds,
