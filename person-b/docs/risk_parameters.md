@@ -77,3 +77,65 @@ Mit Min EV = 3%:
 - Bei Ask = 0.50: Eigene P muss >= 54.3% sein
 - Bei Ask = 0.52: Eigene P muss >= 56.3% sein
 - Bei Ask = 0.55: Eigene P muss >= 59.4% sein
+
+## Slippage-Analyse (aus Live-Daten)
+
+Gemessen am: 2026-02-22
+Anzahl Maerkte: 5
+
+### Orderbook-Struktur
+
+BTC 5-Min Maerkte zeigen typischerweise:
+- **Orderbook-Tiefe:** 40,000-60,000 Kontrakte
+- **Preisniveaus:** 40-50 Levels
+- **Spread:** Variiert stark je nach Marktphase
+
+### Slippage nach Ordergroesse
+
+| Ordergroesse | Durchschn. Slippage | Max Slippage |
+|--------------|---------------------|--------------|
+| $10          | ~0.15%              | ~0.25%       |
+| $25          | ~0.50%              | ~0.70%       |
+| $50          | ~1.20%              | ~1.50%       |
+
+**Hinweis:** Bei extremen Preisen (>0.90 oder <0.10) ist Slippage oft 0%,
+da alle Liquiditaet auf einem Preisniveau konzentriert ist. Die obigen
+Werte gelten fuer balancierte Maerkte (Ask zwischen 0.40-0.60).
+
+### Empfehlung: Maximale Ordergroesse
+
+Um Slippage < 0.5% zu halten:
+- **Empfohlen:** $10-$20 pro Trade
+- **Maximum:** $25 pro Trade
+- **Vermeiden:** > $50 (Slippage > 1%)
+
+### Begruendung
+
+1. BTC 5-Min Maerkte haben begrenzte Liquiditaet
+2. Orderbook-Tiefe variiert stark je nach Marktphase
+3. Groessere Orders fressen durch mehrere Preisniveaus
+4. Bei extremen Preisen (nahe 0 oder 1) ist Slippage minimal
+
+### Slippage-Formel
+
+```python
+# Fill-Preis Berechnung
+total_cost = 0
+total_contracts = 0
+for price, size in asks:
+    contracts_at_level = min(remaining_usd / price, size)
+    total_cost += contracts_at_level * price
+    total_contracts += contracts_at_level
+    remaining_usd -= contracts_at_level * price
+fill_price = total_cost / total_contracts
+
+# Slippage in Prozent
+slippage = (fill_price - best_ask) / best_ask * 100
+```
+
+### Live-Analyse Tool
+
+Slippage kann jederzeit mit dem Script analysiert werden:
+```bash
+python person-b/slippage_analysis.py
+```
