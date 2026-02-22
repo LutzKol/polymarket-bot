@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -85,12 +86,32 @@ def format_duration_seconds(start: datetime, end: datetime) -> int:
     return int((end - start).total_seconds())
 
 
+def _load_config_threshold(config_path: str = "config.json") -> float:
+    """Read alert_threshold_pct from config.json, fallback to 0.3."""
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return float(cfg.get("alert_threshold_pct", 0.3))
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, TypeError):
+        return 0.3
+
+
 def main() -> int:
+    config_default = _load_config_threshold()
+
     parser = argparse.ArgumentParser(description="Analyze lag events from oracle_lag_log.csv")
     parser.add_argument("--csv", default="oracle_lag_log.csv", help="Path to lag CSV file")
-    parser.add_argument("--threshold", type=float, default=0.3, help="Absolute lag threshold in percent")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help=f"Absolute lag threshold in percent (default: {config_default} from config.json)",
+    )
     parser.add_argument("--min-events", type=int, default=2, help="Target minimum number of events")
     args = parser.parse_args()
+
+    if args.threshold is None:
+        args.threshold = config_default
 
     csv_path = Path(args.csv)
     if not csv_path.exists():

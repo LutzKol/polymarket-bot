@@ -13,12 +13,14 @@ from typing import Optional
 
 try:
     from phase2_pipeline.feature_extractor import FEATURE_COLUMNS, FeatureExtractor
+    from phase2_pipeline.feature_normalizer import FeatureNormalizer
     from phase2_pipeline.live_runner import Phase2LiveRunner, load_config
 except ModuleNotFoundError:
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from phase2_pipeline.feature_extractor import FEATURE_COLUMNS, FeatureExtractor
+    from phase2_pipeline.feature_normalizer import FeatureNormalizer
     from phase2_pipeline.live_runner import Phase2LiveRunner, load_config
 
 
@@ -60,9 +62,11 @@ async def export_loop(
     export_interval: float,
     duration_seconds: Optional[float],
     seconds_remaining: Optional[float],
+    normalize: bool = False,
 ) -> None:
     writer, handle = _open_writer(output_csv)
     extractor = FeatureExtractor()
+    normalizer = FeatureNormalizer() if normalize else None
     started = asyncio.get_running_loop().time()
     rows_written = 0
 
@@ -81,12 +85,15 @@ async def export_loop(
             spot_prices = snapshot.get("spot_prices", [])
             round_ids = snapshot.get("oracle_round_ids", [])
 
-            # Skip export until we have at least one oracle AND spot price.
+            # Skip export until we have at least one oracle AND spot price
             if not oracle_prices or not spot_prices:
                 await asyncio.sleep(export_interval)
                 continue
 
             features = extractor.extract(snapshot)
+            if normalizer is not None:
+                normalizer.update(features)
+                features = normalizer.normalize(features)
 
             oracle_price = oracle_prices[-1]
             spot_price = spot_prices[-1]
@@ -144,6 +151,7 @@ def parse_args() -> argparse.Namespace:
         help="Optional fixed seconds_remaining for tau/tau_sq feature",
     )
     parser.add_argument("--duration-seconds", type=float, default=None, help="Optional max runtime")
+    parser.add_argument("--normalize", action="store_true", help="Apply z-score normalization to features")
     return parser.parse_args()
 
 
@@ -204,6 +212,7 @@ def main() -> int:
                 export_interval=args.export_interval,
                 duration_seconds=args.duration_seconds,
                 seconds_remaining=args.seconds_remaining,
+                normalize=args.normalize,
             )
         )
     except KeyboardInterrupt:

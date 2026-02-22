@@ -8,6 +8,26 @@ from typing import Optional
 from phase2_pipeline.features import calculate_obi, log_return
 
 
+FEATURE_BOUNDS: dict[str, tuple[float, float]] = {
+    "oracle_lag_pct": (-5.0, 5.0),
+    "momentum_30s": (-0.1, 0.1),
+    "momentum_60s": (-0.2, 0.2),
+    "slope": (-100.0, 100.0),
+    "sigma_short": (0.0, 1.0),
+    "sigma_long": (0.0, 1.0),
+    "sigma_ratio": (0.0, 10.0),
+    "obi": (-1.0, 1.0),
+    "cvd_60s": (-1e6, 1e6),
+    "tau": (0.0, 1.0),
+    "tau_sq": (0.0, 1.0),
+    "funding_rate": (-0.05, 0.05),
+    "pm_best_bid": (0.0, 1.0),
+    "pm_best_ask": (0.0, 1.0),
+    "pm_mid_prob": (0.0, 1.0),
+    "pm_spread": (0.0, 1.0),
+    "pm_obi": (-1.0, 1.0),
+}
+
 FEATURE_COLUMNS = [
     "oracle_lag_pct",
     "momentum_30s",
@@ -79,6 +99,24 @@ def _calc_slope(values: list[float], window: int = 10) -> Optional[float]:
 class FeatureExtractor:
     """Extract normalized feature dict from a unified state snapshot."""
 
+    def __init__(self, bounds: dict[str, tuple[float, float]] | None = None):
+        self.bounds = bounds if bounds is not None else FEATURE_BOUNDS
+        self.violation_counts: dict[str, int] = {}
+
+    def _clip_features(self, features: dict) -> dict:
+        """Clip feature values to configured bounds, counting violations."""
+        for key, value in features.items():
+            if value is None:
+                continue
+            bounds = self.bounds.get(key)
+            if bounds is None:
+                continue
+            lo, hi = bounds
+            if value < lo or value > hi:
+                self.violation_counts[key] = self.violation_counts.get(key, 0) + 1
+                features[key] = max(lo, min(hi, value))
+        return features
+
     def extract(self, snapshot: dict) -> dict:
         oracle_prices = [_safe_float(x) for x in snapshot.get("oracle_prices", [])]
         spot_prices = [_safe_float(x) for x in snapshot.get("spot_prices", [])]
@@ -145,4 +183,4 @@ class FeatureExtractor:
             "pm_spread": pm_spread,
             "pm_obi": pm_obi,
         }
-        return out
+        return self._clip_features(out)
