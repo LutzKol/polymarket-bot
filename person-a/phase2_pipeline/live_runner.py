@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,21 +22,41 @@ from web3 import Web3
 from web3.exceptions import Web3Exception
 
 try:
+    from phase2_pipeline.ev_engine import (
+        EVCalculator,
+        KellySizer,
+        ModelLoader,
+        RiskManager,
+        evaluate_signal,
+    )
+    from phase2_pipeline.feature_extractor import FEATURE_COLUMNS, FeatureExtractor
+    from phase2_pipeline.feature_normalizer import FeatureNormalizer
     from phase2_pipeline.features import calculate_obi
     from phase2_pipeline.funding_client import FundingRatePoller
     from phase2_pipeline.polymarket_client import PolymarketBookPoller
     from phase2_pipeline.state_store import UnifiedStateStore
     from phase2_pipeline.time_utils import seconds_remaining_in_5m_window
+    from phase2_pipeline.trade_signal import TradeSignal
     from phase2_pipeline.ws_manager import FeedConfig, WebSocketManager
 except ModuleNotFoundError:
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from phase2_pipeline.ev_engine import (
+        EVCalculator,
+        KellySizer,
+        ModelLoader,
+        RiskManager,
+        evaluate_signal,
+    )
+    from phase2_pipeline.feature_extractor import FEATURE_COLUMNS, FeatureExtractor
+    from phase2_pipeline.feature_normalizer import FeatureNormalizer
     from phase2_pipeline.features import calculate_obi
     from phase2_pipeline.funding_client import FundingRatePoller
     from phase2_pipeline.polymarket_client import PolymarketBookPoller
     from phase2_pipeline.state_store import UnifiedStateStore
     from phase2_pipeline.time_utils import seconds_remaining_in_5m_window
+    from phase2_pipeline.trade_signal import TradeSignal
     from phase2_pipeline.ws_manager import FeedConfig, WebSocketManager
 
 CHAINLINK_ABI = [
@@ -75,9 +96,21 @@ class Phase2LiveRunner:
         funding_symbol: str = "BTCUSDT",
         funding_poll_seconds: float = 30.0,
         funding_base_url: str = "https://fapi.binance.com",
+        max_oracle_age_seconds: float = 300.0,
+        # Phase 4: EV-Engine params
+        model_path: str = "",
+        model_feature_columns: Optional[list[str]] = None,
+        bankroll_usdc: float = 1000.0,
+        max_fraction_per_trade: float = 0.02,
+        ev_threshold: float = 0.02,
+        brier_gate: float = 0.24,
+        max_consecutive_losses: int = 3,
+        signal_csv_path: str = "data/trade_signals.csv",
     ):
         self.oracle_poll_seconds = oracle_poll_seconds
         self.heartbeat_seconds = heartbeat_seconds
+        self.max_oracle_age_seconds = max_oracle_age_seconds
+        self.oracle_stale = False
         self.stop_event: Optional[asyncio.Event] = None
         self.state = UnifiedStateStore(history_size=history_size)
         self.ws_manager = WebSocketManager(logger=self._log)
@@ -114,6 +147,28 @@ class Phase2LiveRunner:
                 logger=self._log,
             )
 
+        # Phase 4: EV-Engine initialization
+        self.ev_enabled = False
+        self.bankroll_usdc = bankroll_usdc
+        self.signal_csv_path = signal_csv_path
+
+        if model_path:
+            try:
+                feature_cols = model_feature_columns or FEATURE_COLUMNS
+                self.model_loader = ModelLoader(model_path, feature_cols)
+                self.ev_calculator = EVCalculator(ev_threshold=ev_threshold)
+                self.kelly_sizer = KellySizer(max_fraction=max_fraction_per_trade)
+                self.risk_manager = RiskManager(
+                    max_consecutive_losses=max_consecutive_losses,
+                    brier_gate=brier_gate,
+                    max_fraction=max_fraction_per_trade,
+                )
+                self.feature_extractor = FeatureExtractor()
+                self.feature_normalizer = FeatureNormalizer()
+                self.ev_enabled = True
+            except FileNotFoundError as exc:
+                self._log(f"[EV] Model file not found, EV disabled: {exc}")
+
     def _log(self, message: str) -> None:
         print(f"[{_utc_iso()}] {message}")
 
@@ -121,6 +176,24 @@ class Phase2LiveRunner:
         if self.stop_event is None:
             self.stop_event = asyncio.Event()
         return self.stop_event
+
+    def _init_signal_csv(self) -> None:
+        """Write CSV header if the signal file does not exist yet."""
+        path = Path(self.signal_csv_path)
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(TradeSignal.csv_columns())
+
+    def _log_signal(self, signal: TradeSignal) -> None:
+        """Append a trade signal row to the CSV file."""
+        path = Path(self.signal_csv_path)
+        with path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            row = signal.to_dict()
+            writer.writerow([row[col] for col in TradeSignal.csv_columns()])
+            f.flush()
 
     def _fetch_oracle_blocking(self) -> tuple[int, float, int]:
         raw = self.chainlink_contract.functions.latestRoundData().call()
@@ -166,10 +239,17 @@ class Phase2LiveRunner:
             cvd_60s = self.state.cvd_window(60)
 
             oracle_age = "n/a"
+            oracle_stale = False
             if self.state.oracle_updated_at:
-                oracle_age = str(
-                    int(datetime.now(timezone.utc).timestamp()) - int(self.state.oracle_updated_at)
-                )
+                age_seconds = int(datetime.now(timezone.utc).timestamp()) - int(self.state.oracle_updated_at)
+                oracle_age = str(age_seconds)
+                if age_seconds > self.max_oracle_age_seconds:
+                    oracle_stale = True
+                    self._log(
+                        f"[ORACLE] WARNING: oracle stale (age={age_seconds}s > "
+                        f"max={self.max_oracle_age_seconds}s) — skipping feature export"
+                    )
+            self.oracle_stale = oracle_stale
 
             oracle_str = f"{oracle:,.2f}" if oracle is not None else "n/a"
             spot_str = f"{spot:,.2f}" if spot is not None else "n/a"
@@ -199,6 +279,40 @@ class Phase2LiveRunner:
                 f"oracle_age_s={oracle_age} "
                 f"ticks(o/s/t/d/pm/f)={self.total_oracle_ticks}/{self.total_spot_ticks}/{self.total_trade_ticks}/{self.total_depth_ticks}/{self.total_pm_ticks}/{self.total_funding_ticks}"
             )
+
+            # Phase 4: EV-Engine evaluation
+            if self.ev_enabled and not oracle_stale:
+                try:
+                    snapshot = self.state.snapshot()
+                    snapshot["cvd_60s"] = cvd_60s
+                    features = self.feature_extractor.extract(snapshot)
+                    self.feature_normalizer.update(features)
+                    normalized = self.feature_normalizer.normalize(features)
+
+                    market_prob = self.state.pm_mid_prob if self.state.pm_mid_prob is not None else 0.5
+
+                    signal = evaluate_signal(
+                        features=normalized,
+                        model=self.model_loader,
+                        market_prob=market_prob,
+                        bankroll=self.bankroll_usdc,
+                        risk_manager=self.risk_manager,
+                        ev_calculator=self.ev_calculator,
+                        kelly_sizer=self.kelly_sizer,
+                        oracle_stale=oracle_stale,
+                    )
+                    self._log_signal(signal)
+                    self._log(
+                        f"[EV] dir={signal.direction} p_model={signal.model_probability:.4f} "
+                        f"p_mkt={signal.market_probability:.4f} ev={signal.ev:.4f} "
+                        f"kelly={signal.kelly_fraction:.4f} size=${signal.suggested_size_usdc:.2f} "
+                        f"risk_ok={signal.risk_checks_passed}"
+                    )
+                except Exception as exc:
+                    self._log(f"[EV] error during evaluation: {exc}")
+            elif self.ev_enabled:
+                self._log("[EV] skipped — oracle stale")
+
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=self.heartbeat_seconds)
             except asyncio.TimeoutError:
@@ -245,6 +359,12 @@ class Phase2LiveRunner:
         block_no = self.w3.eth.block_number
         self._log(f"[BOOT] Polygon connected (block={block_no})")
 
+        if self.ev_enabled:
+            self._init_signal_csv()
+            self._log(f"[EV] EV Engine enabled (model loaded, signals → {self.signal_csv_path})")
+        else:
+            self._log("[EV] EV Engine disabled (no model_path)")
+
         feeds = [
             FeedConfig(
                 name="binance_ticker",
@@ -288,8 +408,11 @@ class Phase2LiveRunner:
 
 
 def load_config(path: Path) -> dict:
+    from phase2_pipeline.config_validator import validate_config
+
     with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        raw = json.load(f)
+    return validate_config(raw)
 
 
 def parse_args() -> argparse.Namespace:
@@ -365,6 +488,12 @@ def main() -> int:
         else str(config.get("funding_base_url", "https://fapi.binance.com"))
     )
 
+    # Phase 4: EV-Engine config
+    model_path = str(config.get("model_path", ""))
+    model_feature_columns = config.get("model_feature_columns")
+    if isinstance(model_feature_columns, list):
+        model_feature_columns = [str(c) for c in model_feature_columns]
+
     runner = Phase2LiveRunner(
         rpc_url=config["polygon_rpc_url"],
         chainlink_address=config.get("chainlink_address", "0xc907E116054Ad103354f2D350FD2514433D57F6f"),
@@ -378,6 +507,16 @@ def main() -> int:
         funding_symbol=funding_symbol,
         funding_poll_seconds=funding_poll_seconds,
         funding_base_url=funding_base_url,
+        max_oracle_age_seconds=float(config.get("max_oracle_age_seconds", 300)),
+        # Phase 4
+        model_path=model_path,
+        model_feature_columns=model_feature_columns,
+        bankroll_usdc=float(config.get("bankroll_usdc", 1000.0)),
+        max_fraction_per_trade=float(config.get("max_fraction_per_trade", 0.02)),
+        ev_threshold=float(config.get("ev_threshold", 0.02)),
+        brier_gate=float(config.get("brier_gate", 0.24)),
+        max_consecutive_losses=int(config.get("max_consecutive_losses", 3)),
+        signal_csv_path=str(config.get("signal_csv_path", "data/trade_signals.csv")),
     )
 
     try:

@@ -10,5 +10,15 @@
     "funding_symbol": "BTCUSDT",
     "funding_base_url": "https://fapi.binance.com",
     "funding_poll_seconds": 30,
-    "log_file": "oracle_lag_log.csv"
+    "log_file": "oracle_lag_log.csv",
+    "max_oracle_age_seconds": 300,
+
+    "model_path": "",
+    "model_feature_columns": ["oracle_lag_pct", "sigma_short", "momentum_30s"],
+    "bankroll_usdc": 1000.0,
+    "max_fraction_per_trade": 0.02,
+    "ev_threshold": 0.02,
+    "brier_gate": 0.24,
+    "max_consecutive_losses": 3,
+    "signal_csv_path": "data/trade_signals.csv"
 }
