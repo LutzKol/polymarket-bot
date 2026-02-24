@@ -73,11 +73,8 @@ def generate_signal(oracle_lag_pct):
     return "NONE", abs(oracle_lag_pct)
 
 
-def estimate_win_probability(lag_strength):
-    base_wr = 0.545
-    bonus = 0.04
-    extra = max(0, lag_strength - THRESHOLD)
-    return min(0.70, base_wr + extra * bonus)
+# Fixed win rate from backtest (5% threshold = 54.5% WR)
+BACKTEST_WIN_RATE = 0.545
 
 
 def print_alert(signal, lag, p_win, ev, ask=None):
@@ -151,7 +148,7 @@ def main():
                 continue
 
             sig_count += 1
-            p_win = estimate_win_probability(strength)
+            p_win = BACKTEST_WIN_RATE  # Fixed 54.5% from backtest
             ask = pm_ask if pm_ask and MIN_ASK <= pm_ask <= MAX_ASK else 0.50
             ev = calculate_ev(p_win, ask)
 
