@@ -1,5 +1,5 @@
 {
-    "polygon_rpc_url": "https://polygon-mainnet.g.alchemy.com/v2/Ix3V5IAZIZLQFRbS1yRN-",
+    "polygon_rpc_url": "https://polygon-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
     "chainlink_address": "0xc907E116054Ad103354f2D350FD2514433D57F6f",
     "alert_threshold_pct": 0.35,
     "oracle_poll_seconds": 5,
@@ -23,13 +23,13 @@
     "ev_threshold": 0.02,
     "brier_gate": 0.24,
     "max_consecutive_losses": 3,
-    "signal_csv_path": "data/trade_signals.csv"
-    ,
-    "trade_alerts_enabled": true,
+    "signal_csv_path": "data/trade_signals.csv",
+
+    "trade_alerts_enabled": false,
     "trade_alert_provider": "telegram",
     "discord_webhook_url": "",
-    "telegram_bot_token": "8221519246:AAGQaZOnJhqOerYoXKgDKAXrmWtIZaqSGlY",
-    "telegram_chat_id": "-5194389201",
+    "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+    "telegram_chat_id": "YOUR_TELEGRAM_CHAT_ID",
     "trade_alert_only_actionable": true,
     "trade_alert_min_interval_seconds": 30,
     "trade_alert_dedupe_by_bucket": true
