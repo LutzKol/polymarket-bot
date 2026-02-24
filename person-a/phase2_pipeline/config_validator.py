@@ -38,6 +38,17 @@ DEFAULTS = {
     "trade_alert_only_actionable": True,
     "trade_alert_min_interval_seconds": 30.0,
     "trade_alert_dedupe_by_bucket": True,
+    # Phase 5: Paper Trading
+    "paper_trading_enabled": False,
+    "paper_trades_csv_path": "data/paper_trades.csv",
+    "paper_fill_half_spread_bps": 5.0,
+    "paper_fill_slippage_bps": 10.0,
+    "paper_fill_latency_bps": 5.0,
+    "paper_fill_use_variable_fees": True,
+    "paper_max_daily_loss_fraction": 0.08,
+    "paper_max_trades_per_day": 20,
+    "paper_cooldown_after_consecutive_losses": 3,
+    "paper_cooldown_minutes": 30.0,
 }
 
 FLOAT_FIELDS = {
@@ -52,6 +63,11 @@ FLOAT_FIELDS = {
     "ev_threshold",
     "brier_gate",
     "trade_alert_min_interval_seconds",
+    "paper_fill_half_spread_bps",
+    "paper_fill_slippage_bps",
+    "paper_fill_latency_bps",
+    "paper_max_daily_loss_fraction",
+    "paper_cooldown_minutes",
 }
 
 POSITIVE_FLOAT_FIELDS = {
@@ -73,6 +89,8 @@ BOOL_FIELDS = {
     "trade_alerts_enabled",
     "trade_alert_only_actionable",
     "trade_alert_dedupe_by_bucket",
+    "paper_trading_enabled",
+    "paper_fill_use_variable_fees",
 }
 
 

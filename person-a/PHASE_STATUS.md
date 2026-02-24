@@ -60,3 +60,29 @@
 - `python3 phase2_pipeline/data_quality_report.py --csv data/phase3_features_with_pm.csv` => Quality-Check erstellt (Rows/Intervalle/Missing/Gaps)
 - `python3 -m unittest discover -s tests -v` => 17/17 Tests OK (inkl. Funding + Time Utils)
 - `python3 phase2_pipeline/feature_exporter.py --duration-seconds 10 --funding-poll-seconds 2 --polymarket-token-id <valid_token_id> --output-csv data/phase3_features_full.csv` => funding_rate + tau/tau_sq + pm_* live befüllt
+- `python3 -m unittest discover -s tests -v` => 68/68 Tests OK (inkl. Phase 5 paper trading + fill simulation)
+
+## Phase 5 Preparation (Person A) - Implemented
+- [x] Paper-Trading Engine (`/Users/s1/Desktop/Polymarketbot/phase2_pipeline/paper_trading.py`)
+- [x] Fill-Simulation (Spread/Slippage/Latency assumptions in bps)
+- [x] Binary event settlement resolution (YES/NO payout at resolution)
+- [x] Realized PnL + return% + bankroll tracking
+- [x] RiskManager outcome feedback integration (Brier + consecutive losses)
+- [x] Trade summary metrics (win rate, PnL, drawdown)
+- [x] Unit Tests (`/Users/s1/Desktop/Polymarketbot/tests/test_paper_trading.py`)
+- [x] Replay-Runner (Signal CSV + Label CSV -> Paper Trades + Summary) (`/Users/s1/Desktop/Polymarketbot/phase2_pipeline/paper_trade_replay.py`)
+- [x] Offline Signal-Exporter (Feature CSV -> `trade_signals.csv`) (`/Users/s1/Desktop/Polymarketbot/phase2_pipeline/signal_exporter.py`)
+- [x] Dynamische Polymarket Token-Rotation (Gamma -> aktueller BTC 5m Token) (`/Users/s1/Desktop/Polymarketbot/phase2_pipeline/polymarket_client.py`)
+- [x] Paper-Risk Limits (Daily Loss Stop / Cooldown / Max Trades pro Tag) (`/Users/s1/Desktop/Polymarketbot/phase2_pipeline/paper_trading.py`)
+- [x] Variables Polymarket Fee-Modell im Fill/PnL-Replay (`/Users/s1/Desktop/Polymarketbot/phase2_pipeline/paper_trading.py`, `/Users/s1/Desktop/Polymarketbot/phase2_pipeline/paper_trade_replay.py`)
+- [x] Discord-/Telegram-Alerts bei Trade-Vorschlägen (Dedupe + Throttle) (`/Users/s1/Desktop/Polymarketbot/phase2_pipeline/signal_alerts.py`, integriert in `/Users/s1/Desktop/Polymarketbot/phase2_pipeline/live_runner.py`)
+
+## Phase 5 Still Needed For Official Validation
+- [ ] Connect live model outputs (Person B model / calibrated thresholds)
+- [ ] Wire event lifecycle source (open/close resolution timestamps per market)
+- [ ] Run paper-trading campaign (target: 200 trades per roadmap)
+- [ ] Evaluate Phase 5 acceptance metrics on paper results
+
+## Latest Validation
+- `python3 -m unittest discover -s tests -v` => 92/92 Tests OK (inkl. Signal Alerts)
+- `python3 -u phase2_pipeline/feature_exporter.py --polymarket-auto-rotate true --duration-seconds 12 ...` => PM Auto-Rotation live verifiziert (`rotated token`, `pm_*` befüllt)

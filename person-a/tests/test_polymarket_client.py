@@ -1,6 +1,11 @@
 import unittest
 
-from phase2_pipeline.polymarket_client import parse_polymarket_book
+from phase2_pipeline.polymarket_client import (
+    extract_btc_5m_market_candidates_from_event_detail,
+    next_5m_boundary_timestamps,
+    parse_polymarket_book,
+    select_yes_token_id_from_market,
+)
 
 
 class TestPolymarketBookParser(unittest.TestCase):
@@ -45,6 +50,35 @@ class TestPolymarketBookParser(unittest.TestCase):
         self.assertIsNone(out["spread"])
 
 
+class TestPolymarketResolverHelpers(unittest.TestCase):
+    def test_extract_candidates_decodes_string_lists(self):
+        detail = {
+            "markets": [
+                {
+                    "clobTokenIds": '["111","222"]',
+                    "outcomes": '["Up","Down"]',
+                }
+            ]
+        }
+        out = extract_btc_5m_market_candidates_from_event_detail(detail)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["token_ids"], ["111", "222"])
+        self.assertEqual(out[0]["outcomes"], ["Up", "Down"])
+
+    def test_select_yes_prefers_up_outcome(self):
+        market = {"token_ids": ["aaa", "bbb"], "outcomes": ["Down", "Up"]}
+        self.assertEqual(select_yes_token_id_from_market(market), "bbb")
+
+    def test_select_yes_falls_back_first(self):
+        market = {"token_ids": ["aaa", "bbb"], "outcomes": ["Foo", "Bar"]}
+        self.assertEqual(select_yes_token_id_from_market(market), "aaa")
+
+    def test_next_5m_boundary_timestamps_count(self):
+        out = next_5m_boundary_timestamps(3)
+        self.assertEqual(len(out), 3)
+        self.assertTrue(all(isinstance(x, int) for x in out))
+        self.assertLess(out[0], out[1])
+
+
 if __name__ == "__main__":
     unittest.main()
-
