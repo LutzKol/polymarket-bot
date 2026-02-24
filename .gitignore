@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+.pycache_local/
+*.pyc
+config.json
+logs/
+data/
+*.zip
+*.bundle
+polymarket-bot/
