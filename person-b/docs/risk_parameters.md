@@ -203,3 +203,42 @@ Slippage kann jederzeit mit dem Script analysiert werden:
 ```bash
 python person-b/slippage_analysis.py
 ```
+
+---
+
+## Oracle Lag Signal-Parameter
+
+### Aktueller Threshold
+
+| Parameter | Wert | Aktualisiert |
+|-----------|------|--------------|
+| **Oracle Lag Threshold** | **5.0%** | 2026-02-24 |
+| Signal UP | oracle_lag_pct > +5.0% | |
+| Signal DOWN | oracle_lag_pct < -5.0% | |
+| Signal NONE | abs(oracle_lag_pct) <= 5.0% | |
+
+### Aenderungshistorie
+
+| Datum | Alt | Neu | Begruendung |
+|-------|-----|-----|-------------|
+| 2026-02-24 | 0.35% | **5.0%** | Backtest zeigt echter Edge erst ab 5% |
+
+### Backtest-Ergebnis (2.25 Tage, 450 Samples)
+
+| Threshold | Signale | Win Rate | Status |
+|-----------|---------|----------|--------|
+| 0.35% | 434 | 47.2% | Unter Zufall |
+| 3.50% | 127 | 52.8% | Knapp unter Ziel |
+| **5.00%** | **44** | **54.5%** | **Ziel erreicht** |
+| 5.50% | 30 | 56.7% | Beste WR, wenig Signale |
+
+### Begruendung fuer 5% Threshold
+
+1. **0.35% war falsch:** Zeigt 47.2% Win Rate - schlechter als Muenzwurf
+2. **Edge erst bei Extremen:** Signifikanter Edge nur bei grossen Lag-Werten
+3. **Trade-off:** 5.0% bietet Balance zwischen Signal-Frequenz und Win Rate
+4. **Erwartete Frequenz:** ~20 Signale/Tag bei 5.0% Threshold
+
+### Verweis
+
+Detaillierte Analyse: [signal_analysis.md](signal_analysis.md)

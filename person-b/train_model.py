@@ -1,54 +1,125 @@
 """
-Logistic Regression Model Training with Walk-Forward Backtest.
-Features: oracle_lag_pct, sigma, momentum
+Logistic Regression Model Training v3 - Full Feature Set
+Aggregates 5-minute buckets from tick data, Walk-Forward Backtest
 """
 import csv
 import math
 import os
+import pickle
+from datetime import datetime
+from collections import defaultdict
 from typing import List, Dict, Tuple
 
+FEATURE_COLS = [
+    'oracle_lag_pct', 'obi', 'cvd_60s', 'sigma_short', 'sigma_long',
+    'sigma_ratio', 'momentum_30s', 'momentum_60s', 'slope',
+    'pm_best_bid', 'pm_best_ask', 'pm_mid_prob', 'pm_spread', 'pm_obi'
+]
 
-def load_data(filepath: str) -> List[Dict]:
-    """Load labeled data from CSV."""
-    with open(filepath, 'r', newline='') as f:
-        return list(csv.DictReader(f))
+
+def safe_float(val):
+    try:
+        return float(val) if val else None
+    except:
+        return None
 
 
-def compute_features(rows: List[Dict]) -> List[Dict]:
-    """
-    Compute features for each row:
-    - oracle_lag_pct: (price - prev_price) / prev_price * 100
-    - sigma: rolling std of last 10 prices
-    - momentum: log(price / price_3_back)
-    """
-    prices = [float(r['price']) for r in rows]
-    features = []
+def avg(vals):
+    valid = [v for v in vals if v is not None]
+    return sum(valid) / len(valid) if valid else None
 
-    for i in range(len(rows)):
-        # Need at least 10 previous prices for sigma
-        if i < 10:
+
+def last_valid(vals):
+    for v in reversed(vals):
+        if v is not None:
+            return v
+    return None
+
+
+def load_and_aggregate(filepath: str) -> List[Dict]:
+    """Load tick data and aggregate to 5-minute buckets."""
+    with open(filepath, 'r', newline='', encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+    print(f"Loaded {len(rows):,} ticks")
+
+    buckets = defaultdict(list)
+    for row in rows:
+        ts_str = row.get('timestamp_utc', '')
+        if not ts_str:
+            continue
+        try:
+            dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+            bucket_minute = (dt.minute // 5) * 5
+            bucket_key = dt.replace(minute=bucket_minute, second=0, microsecond=0)
+            buckets[bucket_key].append(row)
+        except:
+            pass
+
+    sorted_keys = sorted(buckets.keys())
+    aggregated = []
+    for bucket_ts in sorted_keys:
+        ticks = buckets[bucket_ts]
+        agg = {
+            'bucket_ts': bucket_ts,
+            'oracle_price': last_valid([safe_float(t.get('oracle_price_usd')) for t in ticks]),
+            'oracle_lag_pct': avg([safe_float(t.get('oracle_lag_pct')) for t in ticks]),
+            'obi': avg([safe_float(t.get('obi')) for t in ticks]),
+            'cvd_60s': avg([safe_float(t.get('cvd_60s')) for t in ticks]),
+            'sigma_short': last_valid([safe_float(t.get('sigma_short')) for t in ticks]),
+            'sigma_long': last_valid([safe_float(t.get('sigma_long')) for t in ticks]),
+            'sigma_ratio': avg([safe_float(t.get('sigma_ratio')) for t in ticks]),
+            'momentum_30s': avg([safe_float(t.get('momentum_30s')) for t in ticks]),
+            'momentum_60s': avg([safe_float(t.get('momentum_60s')) for t in ticks]),
+            'slope': avg([safe_float(t.get('slope')) for t in ticks]),
+            'pm_best_bid': last_valid([safe_float(t.get('pm_best_bid')) for t in ticks]),
+            'pm_best_ask': last_valid([safe_float(t.get('pm_best_ask')) for t in ticks]),
+            'pm_mid_prob': last_valid([safe_float(t.get('pm_mid_prob')) for t in ticks]),
+            'pm_spread': last_valid([safe_float(t.get('pm_spread')) for t in ticks]),
+            'pm_obi': avg([safe_float(t.get('pm_obi')) for t in ticks]),
+        }
+        aggregated.append(agg)
+    print(f"Aggregated to {len(aggregated)} 5-minute buckets")
+    return aggregated
+
+
+def create_labels(aggregated: List[Dict], filter_same: bool = True) -> Tuple[List[List[float]], List[int]]:
+    """Create labels: Up=1 if next bucket price > current."""
+    X, y = [], []
+    skipped_same, skipped_missing = 0, 0
+
+    for i in range(len(aggregated) - 1):
+        curr, next_b = aggregated[i], aggregated[i + 1]
+        curr_price, next_price = curr['oracle_price'], next_b['oracle_price']
+
+        if curr_price is None or next_price is None:
+            skipped_missing += 1
             continue
 
-        # oracle_lag_pct
-        oracle_lag_pct = (prices[i] - prices[i-1]) / prices[i-1] * 100
+        if filter_same and abs(next_price - curr_price) < 0.01:
+            skipped_same += 1
+            continue
 
-        # sigma: rolling std of last 10 prices
-        window = prices[i-9:i+1]  # 10 prices including current
-        mean = sum(window) / len(window)
-        variance = sum((p - mean) ** 2 for p in window) / len(window)
-        sigma = math.sqrt(variance)
+        features = []
+        missing = False
+        for col in FEATURE_COLS:
+            val = curr.get(col)
+            if val is None:
+                missing = True
+                break
+            features.append(val)
 
-        # momentum: log(price / price_3_back)
-        momentum = math.log(prices[i] / prices[i-3])
+        if missing:
+            skipped_missing += 1
+            continue
 
-        features.append({
-            'oracle_lag_pct': oracle_lag_pct,
-            'sigma': sigma,
-            'momentum': momentum,
-            'label': int(rows[i]['label'])
-        })
+        label = 1 if next_price > curr_price else 0
+        X.append(features)
+        y.append(label)
 
-    return features
+    print(f"Valid samples: {len(X)}, Skipped SAME: {skipped_same}, Missing: {skipped_missing}")
+    up = sum(y)
+    print(f"Labels: {up} Up ({100*up/len(y):.1f}%), {len(y)-up} Down ({100*(len(y)-up)/len(y):.1f}%)")
+    return X, y
 
 
 def sigmoid(z: float) -> float:
@@ -127,108 +198,184 @@ def win_rate(y_true: List[int], y_proba: List[float]) -> float:
     return correct_up / len(predicted_up)
 
 
-def normalize_features(X_train: List[List[float]], X_test: List[List[float]]) -> Tuple[List[List[float]], List[List[float]]]:
+def normalize_features(X_train: List[List[float]], X_test: List[List[float]]) -> Tuple[List[List[float]], List[List[float]], List[float], List[float]]:
     """Normalize features using train set statistics."""
     n_features = len(X_train[0])
-    means = []
-    stds = []
+    means, stds = [], []
 
     for j in range(n_features):
         col = [x[j] for x in X_train]
         mean = sum(col) / len(col)
-        std = math.sqrt(sum((v - mean) ** 2 for v in col) / len(col))
+        variance = sum((v - mean) ** 2 for v in col) / len(col)
+        std = math.sqrt(variance) if variance > 0 else 1.0
         means.append(mean)
-        stds.append(std if std > 0 else 1.0)
+        stds.append(std)
 
-    X_train_norm = [[((x[j] - means[j]) / stds[j]) for j in range(n_features)] for x in X_train]
-    X_test_norm = [[((x[j] - means[j]) / stds[j]) for j in range(n_features)] for x in X_test]
+    X_train_norm = [[(x[j] - means[j]) / stds[j] for j in range(n_features)] for x in X_train]
+    X_test_norm = [[(x[j] - means[j]) / stds[j] for j in range(n_features)] for x in X_test]
+    return X_train_norm, X_test_norm, means, stds
 
-    return X_train_norm, X_test_norm
+
+def isotonic_calibration(y_true: List[int], y_proba: List[float]) -> List[Tuple[float, float]]:
+    """Fit isotonic regression using PAV algorithm."""
+    pairs = sorted(zip(y_proba, y_true), key=lambda x: x[0])
+    calibrated = [[pairs[i][0], float(pairs[i][1]), 1] for i in range(len(pairs))]
+    i = 0
+    while i < len(calibrated) - 1:
+        if calibrated[i][1] / calibrated[i][2] > calibrated[i+1][1] / calibrated[i+1][2]:
+            calibrated[i][1] += calibrated[i+1][1]
+            calibrated[i][2] += calibrated[i+1][2]
+            calibrated.pop(i+1)
+            if i > 0:
+                i -= 1
+        else:
+            i += 1
+    return [(block[0], block[1] / block[2]) for block in calibrated]
 
 
-def walk_forward_backtest(features: List[Dict], train_size: int = 700, test_size: int = 100, n_folds: int = 5):
-    """
-    Walk-forward backtest with rolling windows.
-    """
+def apply_calibration(y_proba: List[float], calibration_map: List[Tuple[float, float]]) -> List[float]:
+    """Apply isotonic calibration to probabilities."""
+    calibrated = []
+    for p in y_proba:
+        best_idx = 0
+        for i, (thresh, _) in enumerate(calibration_map):
+            if thresh <= p:
+                best_idx = i
+        calibrated.append(calibration_map[best_idx][1])
+    return calibrated
+
+
+def walk_forward_backtest(X: List[List[float]], y: List[int], train_size: int = 350, test_size: int = 128):
+    """Walk-forward backtest with isotonic calibration."""
     results = []
+    n_samples = len(X)
+    max_folds = (n_samples - train_size) // test_size
 
-    # Calculate max possible folds
-    max_folds = (len(features) - train_size) // test_size
-    actual_folds = min(n_folds, max_folds)
-    print(f"(Max possible folds with data: {max_folds}, using: {actual_folds})")
+    print(f"\nWalk-Forward Backtest (Train={train_size}, Test={test_size}, Folds={max_folds})")
+    print("-" * 70)
 
-    for fold in range(actual_folds):
+    for fold in range(max_folds):
         start = fold * test_size
         train_end = start + train_size
-        test_end = train_end + test_size
-
-        if test_end > len(features):
+        test_end = min(train_end + test_size, n_samples)
+        if test_end > n_samples:
             break
 
-        train_data = features[start:train_end]
-        test_data = features[train_end:test_end]
+        X_train, y_train = X[start:train_end], y[start:train_end]
+        X_test, y_test = X[train_end:test_end], y[train_end:test_end]
 
-        # Prepare data
-        X_train = [[d['oracle_lag_pct'], d['sigma'], d['momentum']] for d in train_data]
-        y_train = [d['label'] for d in train_data]
-        X_test = [[d['oracle_lag_pct'], d['sigma'], d['momentum']] for d in test_data]
-        y_test = [d['label'] for d in test_data]
+        X_train_norm, X_test_norm, means, stds = normalize_features(X_train, X_test)
 
-        # Normalize
-        X_train_norm, X_test_norm = normalize_features(X_train, X_test)
+        # Split train: 75% core, 25% calibration
+        cal_size = max(30, len(X_train_norm) // 4)
+        X_core, y_core = X_train_norm[:-cal_size], y_train[:-cal_size]
+        X_cal, y_cal = X_train_norm[-cal_size:], y_train[-cal_size:]
 
-        # Train
-        weights = train_logistic_regression(X_train_norm, y_train, lambda_reg=0.1)
+        weights = train_logistic_regression(X_core, y_core, lambda_reg=0.1)
 
-        # Predict
-        y_proba = predict_proba(X_test_norm, weights)
+        y_cal_proba = predict_proba(X_cal, weights)
+        calibration_map = isotonic_calibration(y_cal, y_cal_proba)
 
-        # Metrics
-        bs = brier_score(y_test, y_proba)
-        acc = accuracy(y_test, y_proba)
-        wr = win_rate(y_test, y_proba)
+        y_proba_raw = predict_proba(X_test_norm, weights)
+        y_proba_cal = apply_calibration(y_proba_raw, calibration_map)
+
+        bs = brier_score(y_test, y_proba_cal)
+        bs_raw = brier_score(y_test, y_proba_raw)
+        acc = accuracy(y_test, y_proba_cal)
+        wr = win_rate(y_test, y_proba_cal)
 
         results.append({
-            'fold': fold + 1,
-            'train_range': f"[{start}:{train_end}]",
-            'test_range': f"[{train_end}:{test_end}]",
-            'brier_score': bs,
-            'accuracy': acc,
-            'win_rate': wr,
-            'weights': weights
+            'fold': fold + 1, 'brier': bs, 'brier_raw': bs_raw,
+            'accuracy': acc, 'win_rate': wr, 'weights': weights,
+            'means': means, 'stds': stds, 'calibration_map': calibration_map
         })
-
-        print(f"Fold {fold + 1}: Brier={bs:.4f}, Acc={acc:.2%}, WinRate={wr:.2%}")
+        print(f"Fold {fold+1}: Brier={bs:.4f} (raw={bs_raw:.4f}), Acc={acc:.2%}, WinRate={wr:.2%}, n={len(y_test)}")
 
     return results
 
 
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    input_path = os.path.join(script_dir, 'labeled_data.csv')
+    data_path = os.path.join(os.path.dirname(script_dir), 'person-a', 'data', 'phase3_features_training.csv')
+    model_path = os.path.join(script_dir, 'model.pkl')
 
-    print("Loading data...")
-    rows = load_data(input_path)
-    print(f"Loaded {len(rows)} rows")
+    print("=" * 70)
+    print("Model Training v3 - Full Feature Set (14 Features)")
+    print("=" * 70)
 
-    print("\nComputing features...")
-    features = compute_features(rows)
-    print(f"Features computed for {len(features)} rows (after dropping first 10)")
+    print("\n[1] Loading and aggregating data...")
+    aggregated = load_and_aggregate(data_path)
 
-    print("\nWalk-Forward Backtest (Train=700, Test=100, 5 Folds):")
-    print("-" * 60)
-    results = walk_forward_backtest(features)
+    print("\n[2] Creating labels...")
+    X, y = create_labels(aggregated, filter_same=True)
 
-    # Averages
-    avg_brier = sum(r['brier_score'] for r in results) / len(results)
+    if len(X) < 100:
+        print("ERROR: Not enough samples!")
+        return
+
+    # Adjust split based on available samples
+    n_samples = len(X)
+    if n_samples >= 478:
+        train_size, test_size = 350, 128
+    elif n_samples >= 400:
+        train_size, test_size = 300, 100
+    else:
+        train_size, test_size = int(n_samples * 0.7), int(n_samples * 0.2)
+
+    print(f"\n[3] Walk-Forward Backtest (adjusted for {n_samples} samples)...")
+    results = walk_forward_backtest(X, y, train_size=train_size, test_size=test_size)
+
+    avg_brier = sum(r['brier'] for r in results) / len(results)
+    avg_brier_raw = sum(r['brier_raw'] for r in results) / len(results)
     avg_acc = sum(r['accuracy'] for r in results) / len(results)
     avg_wr = sum(r['win_rate'] for r in results) / len(results)
 
-    print("-" * 60)
-    print(f"Average: Brier={avg_brier:.4f}, Acc={avg_acc:.2%}, WinRate={avg_wr:.2%}")
+    print("-" * 70)
+    print(f"AVERAGE: Brier={avg_brier:.4f} (raw={avg_brier_raw:.4f}), Acc={avg_acc:.2%}, WinRate={avg_wr:.2%}")
+    print("-" * 70)
 
-    # Save results for report generation
-    return results, avg_brier, avg_acc, avg_wr
+    print("\n[4] Training final model on all data...")
+    X_norm, _, final_means, final_stds = normalize_features(X, X)
+    cal_size = max(50, len(X_norm) // 4)
+    final_weights = train_logistic_regression(X_norm[:-cal_size], y[:-cal_size], lambda_reg=0.1)
+    y_cal_proba = predict_proba(X_norm[-cal_size:], final_weights)
+    final_calibration = isotonic_calibration(y[-cal_size:], y_cal_proba)
+
+    y_proba_all = apply_calibration(predict_proba(X_norm, final_weights), final_calibration)
+    final_brier = brier_score(y, y_proba_all)
+    final_acc = accuracy(y, y_proba_all)
+    print(f"Final (in-sample): Brier={final_brier:.4f}, Acc={final_acc:.2%}")
+
+    print("\n[5] Evaluation...")
+    print(f"    Target: Brier < 0.24")
+    print(f"    Result: Brier = {avg_brier:.4f}")
+
+    if avg_brier < 0.24:
+        print("    SUCCESS! Saving model...")
+        model = {
+            'weights': final_weights,
+            'means': final_means,
+            'stds': final_stds,
+            'calibration_map': final_calibration,
+            'feature_cols': FEATURE_COLS,
+            'version': 'v3',
+            'trained_at': datetime.now().isoformat(),
+            'metrics': {
+                'avg_brier': avg_brier,
+                'avg_accuracy': avg_acc,
+                'avg_win_rate': avg_wr,
+                'n_samples': len(X),
+                'n_folds': len(results)
+            }
+        }
+        with open(model_path, 'wb') as f:
+            pickle.dump(model, f)
+        print(f"    Model saved to {model_path}")
+    else:
+        print(f"    FAILED - Brier {avg_brier:.4f} >= 0.24")
+        print("    Model NOT saved.")
+
+    return {'avg_brier': avg_brier, 'avg_acc': avg_acc, 'avg_wr': avg_wr, 'n': len(X), 'results': results}
 
 
 if __name__ == '__main__':
