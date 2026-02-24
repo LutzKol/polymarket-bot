@@ -192,6 +192,8 @@ class PaperTradingEngine:
         self._next_trade_id = 1
         self._equity_curve: list[float] = [self.cash_usdc]
         self.last_reject_reason: str = ""
+        self.kill_switch_triggered: bool = False
+        self.kill_switch_reason: str = ""
         self._daily_trade_counts: dict[str, int] = {}
         self._daily_realized_pnl: dict[str, float] = {}
         self._daily_start_equity: dict[str, float] = {}
@@ -222,7 +224,39 @@ class PaperTradingEngine:
             return False
         return (-realized) >= (day_start * float(frac))
 
+    def check_kill_switch(self) -> tuple[bool, str]:
+        """Check kill-switch conditions. Returns (triggered, reason)."""
+        s = self.summary()
+        if s["closed_trades"] >= 50 and s["win_rate"] < 0.54:
+            reason = (
+                f"Win rate below threshold "
+                f"({s['win_rate'] * 100:.1f}% < 54.0%)"
+            )
+            self.kill_switch_triggered = True
+            self.kill_switch_reason = reason
+            return True, reason
+        if s["max_drawdown"] > 0.15:
+            reason = (
+                f"Max drawdown exceeded "
+                f"({s['max_drawdown'] * 100:.1f}% > 15.0%)"
+            )
+            self.kill_switch_triggered = True
+            self.kill_switch_reason = reason
+            return True, reason
+        if self.cash_usdc < self.starting_bankroll_usdc * 0.50:
+            reason = (
+                f"Bankroll below 50% of starting "
+                f"(${self.cash_usdc:,.2f} < ${self.starting_bankroll_usdc * 0.50:,.2f})"
+            )
+            self.kill_switch_triggered = True
+            self.kill_switch_reason = reason
+            return True, reason
+        return False, ""
+
     def _policy_reject_reason(self, signal: TradeSignal) -> str:
+        if self.kill_switch_triggered:
+            return "kill_switch"
+
         ts = signal.timestamp or _utc_now_iso()
         try:
             ts_epoch = _parse_iso_to_epoch(ts)
@@ -399,6 +433,24 @@ class PaperTradingEngine:
 
         return trade
 
+    def resolve_open_trade(self, outcome_up: bool, closed_at: Optional[str] = None) -> PaperTrade:
+        """Resolve the single open trade (convenience for live mode with max 1 open)."""
+        if not self.open_trades:
+            raise KeyError("no open trades to resolve")
+        trade_id = next(iter(self.open_trades))
+        return self.resolve_trade(trade_id, outcome_up, closed_at=closed_at)
+
+    def has_open_trades(self) -> bool:
+        """Return True if there are any open trades."""
+        return len(self.open_trades) > 0
+
+    def open_trade_for_bucket(self, bucket_id: str) -> Optional[int]:
+        """Return trade_id if there's an open trade for this bucket, else None."""
+        for trade_id, trade in self.open_trades.items():
+            if trade.event_id == bucket_id:
+                return trade_id
+        return None
+
     @property
     def open_count(self) -> int:
         return len(self.open_trades)
@@ -406,6 +458,29 @@ class PaperTradingEngine:
     @property
     def closed_count(self) -> int:
         return len(self.closed_trades)
+
+    def daily_summary(self, day_key: str) -> dict:
+        """Stats for a specific UTC day."""
+        self._ensure_day_tracking(day_key)
+        day_trades = [t for t in self.closed_trades
+                      if t.closed_at and _utc_day_key_from_epoch(_parse_iso_to_epoch(t.closed_at)) == day_key]
+        wins = sum(1 for t in day_trades if t.won)
+        losses = sum(1 for t in day_trades if t.won is False)
+        pnl = round(self._daily_realized_pnl.get(day_key, 0.0), 2)
+        return {
+            "day": day_key,
+            "trades": len(day_trades),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(wins / len(day_trades), 4) if day_trades else 0.0,
+            "pnl_usdc": pnl,
+            "start_equity": round(self._daily_start_equity.get(day_key, 0.0), 2),
+            "end_equity": round(self.cash_usdc, 2),
+        }
+
+    def reset_cooldown(self) -> None:
+        """Clear consecutive-loss cooldown (called on daily reset)."""
+        self._cooldown_until_epoch = None
 
     def summary(self) -> dict:
         """Aggregate paper-trading stats for Phase 5 validation."""
