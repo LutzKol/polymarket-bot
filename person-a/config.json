@@ -16,8 +16,7 @@
     "log_file": "oracle_lag_log.csv",
     "max_oracle_age_seconds": 300,
 
-    "model_path": "",
-    "model_feature_columns": ["oracle_lag_pct", "sigma_short", "momentum_30s"],
+    "model_path": "models/model.json",
     "bankroll_usdc": 1000.0,
     "max_fraction_per_trade": 0.02,
     "ev_threshold": 0.02,
@@ -32,5 +31,16 @@
     "telegram_chat_id": "-5194389201",
     "trade_alert_only_actionable": true,
     "trade_alert_min_interval_seconds": 30,
-    "trade_alert_dedupe_by_bucket": true
+    "trade_alert_dedupe_by_bucket": true,
+
+    "paper_trading_enabled": true,
+    "paper_trades_csv_path": "data/paper_trades.csv",
+    "paper_fill_half_spread_bps": 5,
+    "paper_fill_slippage_bps": 10,
+    "paper_fill_latency_bps": 5,
+    "paper_fill_use_variable_fees": true,
+    "paper_max_daily_loss_fraction": 0.08,
+    "paper_max_trades_per_day": 20,
+    "paper_cooldown_after_consecutive_losses": 3,
+    "paper_cooldown_minutes": 30.0
 }

@@ -16,8 +16,7 @@ from phase2_pipeline.trade_signal import TradeSignal
 class ModelLoader:
     """Load a logistic regression model and predict P(UP)."""
 
-    def __init__(self, model_path: str, feature_columns: list[str]):
-        self.feature_columns = feature_columns
+    def __init__(self, model_path: str, feature_columns: list[str] | None = None):
         self._model = None
         self._weights: Optional[list[float]] = None
 
@@ -30,11 +29,18 @@ class ModelLoader:
             with path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
             self._weights = [float(w) for w in data["weights"]]
+            # Prefer feature_columns embedded in the model file
+            if "feature_columns" in data and not feature_columns:
+                feature_columns = data["feature_columns"]
         elif suffix in (".pkl", ".joblib"):
             with path.open("rb") as f:
                 self._model = pickle.load(f)
         else:
             raise ValueError(f"Unsupported model format: {suffix}")
+
+        if not feature_columns:
+            raise ValueError("feature_columns must be provided or embedded in model file")
+        self.feature_columns = feature_columns
 
     def predict_proba(self, features: dict) -> Optional[float]:
         """Return P(UP) given a feature dict, or None if features are missing."""
@@ -65,10 +71,24 @@ class EVCalculator:
         self.ev_threshold = ev_threshold
         self.fee = fee
 
-    def calculate(self, model_prob: float, market_prob: float) -> tuple[float, str]:
-        """Return (ev, direction). Direction is 'NONE' if EV < threshold."""
-        ev_yes = model_prob * (1 - self.fee) - market_prob
-        ev_no = (1 - model_prob) * (1 - self.fee) - (1 - market_prob)
+    def calculate(
+        self,
+        model_prob: float,
+        market_prob: float,
+        cost_yes: float | None = None,
+        cost_no: float | None = None,
+    ) -> tuple[float, str]:
+        """Return (ev, direction). Direction is 'NONE' if EV < threshold.
+
+        When cost_yes / cost_no are provided (from orderbook best ask / 1-best_bid),
+        EV is calculated against the actual entry cost rather than the mid probability.
+        This prevents entering trades where the spread destroys the edge.
+        """
+        price_yes = cost_yes if cost_yes is not None else market_prob
+        price_no = cost_no if cost_no is not None else (1 - market_prob)
+
+        ev_yes = model_prob * (1 - self.fee) - price_yes
+        ev_no = (1 - model_prob) * (1 - self.fee) - price_no
 
         if ev_yes >= ev_no:
             best_ev = ev_yes
@@ -195,6 +215,8 @@ def evaluate_signal(
     ev_calculator: EVCalculator,
     kelly_sizer: KellySizer,
     oracle_stale: bool = False,
+    cost_yes: float | None = None,
+    cost_no: float | None = None,
 ) -> TradeSignal:
     """Top-level convenience: features → TradeSignal."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -202,7 +224,9 @@ def evaluate_signal(
     model_prob = model.predict_proba(features)
 
     if model_prob is not None:
-        ev, direction = ev_calculator.calculate(model_prob, market_prob)
+        ev, direction = ev_calculator.calculate(
+            model_prob, market_prob, cost_yes=cost_yes, cost_no=cost_no,
+        )
         kelly_frac, size_usdc = kelly_sizer.size(
             model_prob, market_prob, direction, bankroll, ev_calculator.fee
         )

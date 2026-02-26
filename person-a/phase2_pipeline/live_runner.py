@@ -33,8 +33,22 @@ try:
     from phase2_pipeline.feature_normalizer import FeatureNormalizer
     from phase2_pipeline.features import calculate_obi
     from phase2_pipeline.funding_client import FundingRatePoller
-    from phase2_pipeline.polymarket_client import PolymarketBookPoller, RotatingPolymarketBookPoller
-    from phase2_pipeline.signal_alerts import SignalAlertConfig, SignalAlertNotifier
+    from phase2_pipeline.paper_trading import (
+        FillConfig,
+        FillSimulator,
+        PaperRiskLimits,
+        PaperTrade,
+        PaperTradingEngine,
+    )
+    from phase2_pipeline.polymarket_client import PolymarketBookPoller, RotatingPolymarketBookPoller, fetch_market_resolution
+    from phase2_pipeline.signal_alerts import (
+        SignalAlertConfig,
+        SignalAlertNotifier,
+        format_daily_reset,
+        format_kill_switch,
+        format_paper_trade_opened,
+        format_paper_trade_resolved,
+    )
     from phase2_pipeline.state_store import UnifiedStateStore
     from phase2_pipeline.time_utils import seconds_remaining_in_5m_window
     from phase2_pipeline.trade_signal import TradeSignal
@@ -54,8 +68,22 @@ except ModuleNotFoundError:
     from phase2_pipeline.feature_normalizer import FeatureNormalizer
     from phase2_pipeline.features import calculate_obi
     from phase2_pipeline.funding_client import FundingRatePoller
-    from phase2_pipeline.polymarket_client import PolymarketBookPoller, RotatingPolymarketBookPoller
-    from phase2_pipeline.signal_alerts import SignalAlertConfig, SignalAlertNotifier
+    from phase2_pipeline.paper_trading import (
+        FillConfig,
+        FillSimulator,
+        PaperRiskLimits,
+        PaperTrade,
+        PaperTradingEngine,
+    )
+    from phase2_pipeline.polymarket_client import PolymarketBookPoller, RotatingPolymarketBookPoller, fetch_market_resolution
+    from phase2_pipeline.signal_alerts import (
+        SignalAlertConfig,
+        SignalAlertNotifier,
+        format_daily_reset,
+        format_kill_switch,
+        format_paper_trade_opened,
+        format_paper_trade_resolved,
+    )
     from phase2_pipeline.state_store import UnifiedStateStore
     from phase2_pipeline.time_utils import seconds_remaining_in_5m_window
     from phase2_pipeline.trade_signal import TradeSignal
@@ -110,6 +138,7 @@ class Phase2LiveRunner:
         ev_threshold: float = 0.02,
         brier_gate: float = 0.24,
         max_consecutive_losses: int = 3,
+        max_pm_spread: float = 0.20,
         signal_csv_path: str = "data/trade_signals.csv",
         trade_alerts_enabled: bool = False,
         trade_alert_provider: str = "",
@@ -119,6 +148,11 @@ class Phase2LiveRunner:
         trade_alert_only_actionable: bool = True,
         trade_alert_min_interval_seconds: float = 30.0,
         trade_alert_dedupe_by_bucket: bool = True,
+        # Phase 5: Paper Trading
+        paper_trading_enabled: bool = False,
+        paper_trades_csv_path: str = "data/paper_trades.csv",
+        paper_fill_config: Optional[FillConfig] = None,
+        paper_risk_limits: Optional[PaperRiskLimits] = None,
     ):
         self.oracle_poll_seconds = oracle_poll_seconds
         self.heartbeat_seconds = heartbeat_seconds
@@ -141,6 +175,13 @@ class Phase2LiveRunner:
         self.total_depth_ticks = 0
         self.total_pm_ticks = 0
         self.total_funding_ticks = 0
+
+        # Polymarket resolution tracking
+        self.polymarket_gamma_base_url = polymarket_gamma_base_url
+        self._current_pm_slug: Optional[str] = None
+        self._pending_resolution_slug: Optional[str] = None
+        self._resolution_retry_count: int = 0
+        self._max_resolution_retries: int = 12
 
         self.polymarket_poller: Optional[PolymarketBookPoller] = None
         if polymarket_token_id:
@@ -171,6 +212,7 @@ class Phase2LiveRunner:
         # Phase 4: EV-Engine initialization
         self.ev_enabled = False
         self.bankroll_usdc = bankroll_usdc
+        self.max_pm_spread = max_pm_spread
         self.signal_csv_path = signal_csv_path
         self.signal_alert_notifier: Optional[SignalAlertNotifier] = None
         alert_cfg = SignalAlertConfig(
@@ -189,8 +231,7 @@ class Phase2LiveRunner:
 
         if model_path:
             try:
-                feature_cols = model_feature_columns or FEATURE_COLUMNS
-                self.model_loader = ModelLoader(model_path, feature_cols)
+                self.model_loader = ModelLoader(model_path, model_feature_columns)
                 self.ev_calculator = EVCalculator(ev_threshold=ev_threshold)
                 self.kelly_sizer = KellySizer(max_fraction=max_fraction_per_trade)
                 self.risk_manager = RiskManager(
@@ -203,6 +244,23 @@ class Phase2LiveRunner:
                 self.ev_enabled = True
             except FileNotFoundError as exc:
                 self._log(f"[EV] Model file not found, EV disabled: {exc}")
+
+        # Phase 5: Paper Trading initialization
+        self.paper_trading_enabled = False
+        self.paper_engine: Optional[PaperTradingEngine] = None
+        self.paper_trades_csv_path = paper_trades_csv_path
+        self._current_bucket_id: Optional[int] = None
+        self._bucket_start_oracle_price: Optional[float] = None
+        self._current_day_key: Optional[str] = None
+
+        if paper_trading_enabled and self.ev_enabled:
+            self.paper_engine = PaperTradingEngine(
+                starting_bankroll_usdc=bankroll_usdc,
+                fill_simulator=FillSimulator(paper_fill_config or FillConfig()),
+                risk_manager=self.risk_manager if hasattr(self, "risk_manager") else None,
+                risk_limits=paper_risk_limits or PaperRiskLimits(),
+            )
+            self.paper_trading_enabled = True
 
     def _log(self, message: str) -> None:
         print(f"[{_utc_iso()}] {message}")
@@ -241,6 +299,164 @@ class Phase2LiveRunner:
                 self._log(f"[ALERT] skipped ({reason})")
         except Exception as exc:
             self._log(f"[ALERT] error: {exc}")
+
+    def _init_paper_trades_csv(self) -> None:
+        """Write CSV header if the paper trades file does not exist yet."""
+        path = Path(self.paper_trades_csv_path)
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(PaperTrade.csv_columns())
+
+    def _log_paper_trade(self, trade: PaperTrade) -> None:
+        """Append a resolved paper trade row to the CSV file."""
+        path = Path(self.paper_trades_csv_path)
+        with path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            row = trade.to_dict()
+            writer.writerow([row[col] for col in PaperTrade.csv_columns()])
+            f.flush()
+
+    def _has_open_paper_trade(self) -> bool:
+        return self.paper_engine is not None and self.paper_engine.has_open_trades()
+
+    def _has_open_paper_trade_in_bucket(self, bucket_id: int) -> bool:
+        if self.paper_engine is None:
+            return False
+        return self.paper_engine.open_trade_for_bucket(str(bucket_id)) is not None
+
+    async def _try_polymarket_resolution(self, oracle_price: float) -> Optional[PaperTrade]:
+        """Try to resolve the pending trade via Polymarket, falling back to oracle."""
+        slug = self._pending_resolution_slug
+        self._resolution_retry_count += 1
+
+        # Try Polymarket resolution
+        if slug:
+            try:
+                result = await asyncio.to_thread(
+                    fetch_market_resolution,
+                    slug,
+                    self.polymarket_gamma_base_url,
+                )
+                if result is not None and result.get("resolved"):
+                    outcome_up = result["outcome_up"]
+                    self._log(f"[PAPER] Polymarket resolved slug={slug}: outcome_up={outcome_up}")
+                    return await self._resolve_trade_with_outcome(outcome_up, "polymarket")
+            except Exception as exc:
+                self._log(f"[PAPER] error polling Polymarket resolution: {exc}")
+
+        # Fall back to oracle if retries exhausted
+        if self._resolution_retry_count >= self._max_resolution_retries:
+            if self._bucket_start_oracle_price is not None:
+                outcome_up = oracle_price > self._bucket_start_oracle_price
+                self._log(
+                    f"[PAPER] Polymarket resolution retries exhausted ({self._max_resolution_retries}), "
+                    f"falling back to oracle: outcome_up={outcome_up}"
+                )
+                return await self._resolve_trade_with_outcome(outcome_up, "oracle_fallback")
+            else:
+                self._log("[PAPER] no bucket start price for oracle fallback")
+                self._pending_resolution_slug = None
+                self._resolution_retry_count = 0
+                return None
+
+        return None
+
+    async def _resolve_trade_with_outcome(self, outcome_up: bool, source: str) -> Optional[PaperTrade]:
+        """Resolve the open paper trade with the given outcome and log it."""
+        if self.paper_engine is None:
+            return None
+        try:
+            trade = self.paper_engine.resolve_open_trade(outcome_up)
+            self._log_paper_trade(trade)
+            outcome_str = "WON" if trade.won else "LOST"
+            self._log(
+                f"[PAPER] resolved trade #{trade.trade_id}: {outcome_str} "
+                f"pnl=${trade.pnl_usdc:+.2f} dir={trade.direction} source={source}"
+            )
+            await self._maybe_alert_paper_trade(trade)
+            # Check kill-switch after resolution
+            if not self.paper_engine.kill_switch_triggered:
+                triggered, ks_reason = self.paper_engine.check_kill_switch()
+                if not triggered and hasattr(self, "risk_manager"):
+                    rb = self.risk_manager.rolling_brier
+                    if rb is not None and rb > self.risk_manager.brier_gate:
+                        ks_reason = (
+                            f"Brier score exceeded threshold "
+                            f"({rb:.3f} > {self.risk_manager.brier_gate})"
+                        )
+                        self.paper_engine.kill_switch_triggered = True
+                        self.paper_engine.kill_switch_reason = ks_reason
+                        triggered = True
+                if triggered:
+                    await self._maybe_alert_kill_switch(ks_reason)
+            return trade
+        except Exception as exc:
+            self._log(f"[PAPER] error resolving trade: {exc}")
+            return None
+
+    async def _maybe_alert_paper_trade_opened(self, trade: PaperTrade) -> None:
+        if self.signal_alert_notifier is None:
+            return
+        msg = format_paper_trade_opened(trade)
+        try:
+            provider = self.signal_alert_notifier.config.provider
+            await asyncio.to_thread(
+                self.signal_alert_notifier._send, provider, msg
+            )
+        except Exception:
+            pass
+
+    async def _maybe_alert_paper_trade(self, trade: PaperTrade) -> None:
+        if self.signal_alert_notifier is None or self.paper_engine is None:
+            return
+        summary = self.paper_engine.summary()
+        msg = format_paper_trade_resolved(trade, summary)
+        try:
+            provider = self.signal_alert_notifier.config.provider
+            await asyncio.to_thread(
+                self.signal_alert_notifier._send, provider, msg
+            )
+        except Exception:
+            pass
+
+    async def _maybe_alert_kill_switch(self, reason: str) -> None:
+        if self.paper_engine is None:
+            return
+        summary = self.paper_engine.summary()
+        self._log(f"[KILL-SWITCH] ACTIVATED: {reason}")
+        if self.signal_alert_notifier is None:
+            return
+        msg = format_kill_switch(reason, summary)
+        try:
+            provider = self.signal_alert_notifier.config.provider
+            await asyncio.to_thread(
+                self.signal_alert_notifier._send, provider, msg
+            )
+        except Exception:
+            pass
+
+    async def _maybe_alert_daily_reset(self, prev_day_key: str) -> None:
+        if self.paper_engine is None:
+            return
+        day_summary = self.paper_engine.daily_summary(prev_day_key)
+        overall_summary = self.paper_engine.summary()
+        self.paper_engine.reset_cooldown()
+        self._log(
+            f"[PAPER] daily reset: {day_summary['wins']}W/{day_summary['losses']}L "
+            f"pnl=${day_summary['pnl_usdc']:+.2f} bankroll=${overall_summary['ending_bankroll_usdc']:,.2f}"
+        )
+        if self.signal_alert_notifier is None:
+            return
+        msg = format_daily_reset(day_summary, overall_summary)
+        try:
+            provider = self.signal_alert_notifier.config.provider
+            await asyncio.to_thread(
+                self.signal_alert_notifier._send, provider, msg
+            )
+        except Exception:
+            pass
 
     def _fetch_oracle_blocking(self) -> tuple[int, float, int]:
         raw = self.chainlink_contract.functions.latestRoundData().call()
@@ -328,18 +544,27 @@ class Phase2LiveRunner:
             )
 
             # Phase 4: EV-Engine evaluation
+            signal: Optional[TradeSignal] = None
             if self.ev_enabled and not oracle_stale:
                 try:
                     snapshot = self.state.snapshot()
                     snapshot["cvd_60s"] = cvd_60s
                     features = self.feature_extractor.extract(snapshot)
                     self.feature_normalizer.update(features)
-                    normalized = self.feature_normalizer.normalize(features)
 
+                    # Pass raw features to model — normalization is baked into
+                    # the model weights by train_model.py, so no z-scoring needed.
                     market_prob = self.state.pm_mid_prob if self.state.pm_mid_prob is not None else 0.5
 
+                    # Use actual orderbook prices for EV calculation so the spread
+                    # is properly accounted for (cost_yes = ask, cost_no = 1 - bid).
+                    _bid = self.state.pm_best_bid
+                    _ask = self.state.pm_best_ask
+                    cost_yes = float(_ask) if _ask is not None else None
+                    cost_no = (1.0 - float(_bid)) if _bid is not None else None
+
                     signal = evaluate_signal(
-                        features=normalized,
+                        features=features,
                         model=self.model_loader,
                         market_prob=market_prob,
                         bankroll=self.bankroll_usdc,
@@ -347,6 +572,8 @@ class Phase2LiveRunner:
                         ev_calculator=self.ev_calculator,
                         kelly_sizer=self.kelly_sizer,
                         oracle_stale=oracle_stale,
+                        cost_yes=cost_yes,
+                        cost_no=cost_no,
                     )
                     self._log_signal(signal)
                     await self._maybe_alert_signal(signal)
@@ -360,6 +587,67 @@ class Phase2LiveRunner:
                     self._log(f"[EV] error during evaluation: {exc}")
             elif self.ev_enabled:
                 self._log("[EV] skipped — oracle stale")
+
+            # Phase 5: Paper Trading — bucket tracking and trade lifecycle
+            if self.paper_trading_enabled and self.paper_engine is not None and oracle is not None:
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                bucket_id = now_ts // 300
+
+                # Daily reset at 00:00 UTC
+                day_key = datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                if self._current_day_key is not None and day_key != self._current_day_key:
+                    await self._maybe_alert_daily_reset(self._current_day_key)
+                self._current_day_key = day_key
+
+                # Bucket changed? Save pending slug for resolution polling
+                if self._current_bucket_id is not None and bucket_id != self._current_bucket_id:
+                    if self._has_open_paper_trade() and self._bucket_start_oracle_price is not None:
+                        self._pending_resolution_slug = self._current_pm_slug
+                        self._resolution_retry_count = 0
+
+                # Poll for Polymarket resolution if pending
+                if self._pending_resolution_slug is not None and self._has_open_paper_trade():
+                    resolved_trade = await self._try_polymarket_resolution(oracle)
+                    if resolved_trade is not None:
+                        self._pending_resolution_slug = None
+                        self._resolution_retry_count = 0
+                elif self._pending_resolution_slug is not None and not self._has_open_paper_trade():
+                    # Trade was already resolved (or doesn't exist), clear pending
+                    self._pending_resolution_slug = None
+                    self._resolution_retry_count = 0
+
+                # Update bucket tracking
+                if self._current_bucket_id is None or bucket_id != self._current_bucket_id:
+                    self._current_bucket_id = bucket_id
+                    self._bucket_start_oracle_price = oracle
+
+                # Open new trade?
+                if signal is not None and signal.direction in ("UP", "DOWN") and signal.risk_checks_passed:
+                    # Spread gate: skip if Polymarket spread is too wide
+                    _pm_spread = self.state.pm_spread
+                    if _pm_spread is not None and _pm_spread > self.max_pm_spread:
+                        self._log(
+                            f"[PAPER] skipped: spread too wide "
+                            f"({_pm_spread:.4f} > {self.max_pm_spread:.4f})"
+                        )
+                    elif not self._has_open_paper_trade_in_bucket(bucket_id):
+                        paper_trade = self.paper_engine.open_trade(
+                            signal=signal,
+                            event_id=str(bucket_id),
+                            pm_best_bid=self.state.pm_best_bid,
+                            pm_best_ask=self.state.pm_best_ask,
+                        )
+                        if paper_trade is not None:
+                            self._log(
+                                f"[PAPER] opened trade #{paper_trade.trade_id}: "
+                                f"dir={paper_trade.direction} entry={paper_trade.entry_price:.4f} "
+                                f"size=${paper_trade.size_usdc:.2f} bucket={bucket_id}"
+                            )
+                            await self._maybe_alert_paper_trade_opened(paper_trade)
+                        elif self.paper_engine.last_reject_reason:
+                            self._log(
+                                f"[PAPER] trade rejected: {self.paper_engine.last_reject_reason}"
+                            )
 
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=self.heartbeat_seconds)
@@ -393,6 +681,10 @@ class Phase2LiveRunner:
             mid_prob=book.get("implied_mid_prob"),
             spread=book.get("spread"),
         )
+        # Track current slug from rotating poller metadata
+        pm_slug = book.get("_pm_slug")
+        if pm_slug:
+            self._current_pm_slug = pm_slug
         self.total_pm_ticks += 1
 
     def on_funding_rate(self, rate: float) -> None:
@@ -412,6 +704,16 @@ class Phase2LiveRunner:
             self._log(f"[EV] EV Engine enabled (model loaded, signals → {self.signal_csv_path})")
         else:
             self._log("[EV] EV Engine disabled (no model_path)")
+
+        if self.paper_trading_enabled and self.paper_engine is not None:
+            self._init_paper_trades_csv()
+            self._log(
+                f"[PAPER] Paper trading enabled "
+                f"(bankroll=${self.paper_engine.starting_bankroll_usdc:.0f}, "
+                f"trades -> {self.paper_trades_csv_path})"
+            )
+        else:
+            self._log("[PAPER] Paper trading disabled")
 
         if self.signal_alert_notifier is not None:
             cfg = self.signal_alert_notifier.config
@@ -653,6 +955,22 @@ def main() -> int:
     if isinstance(model_feature_columns, list):
         model_feature_columns = [str(c) for c in model_feature_columns]
 
+    # Phase 5: Paper Trading config
+    paper_trading_enabled = bool(config.get("paper_trading_enabled", False))
+    paper_trades_csv_path = str(config.get("paper_trades_csv_path", "data/paper_trades.csv"))
+    paper_fill_config = FillConfig(
+        half_spread_bps=float(config.get("paper_fill_half_spread_bps", 5)),
+        slippage_bps=float(config.get("paper_fill_slippage_bps", 10)),
+        latency_bps=float(config.get("paper_fill_latency_bps", 5)),
+        use_variable_fees=bool(config.get("paper_fill_use_variable_fees", True)),
+    )
+    paper_risk_limits = PaperRiskLimits(
+        max_daily_loss_fraction=float(config.get("paper_max_daily_loss_fraction", 0.08)),
+        max_trades_per_day=int(config.get("paper_max_trades_per_day", 20)),
+        cooldown_after_consecutive_losses=int(config.get("paper_cooldown_after_consecutive_losses", 3)),
+        cooldown_minutes=float(config.get("paper_cooldown_minutes", 30.0)),
+    )
+
     runner = Phase2LiveRunner(
         rpc_url=config["polygon_rpc_url"],
         chainlink_address=config.get("chainlink_address", "0xc907E116054Ad103354f2D350FD2514433D57F6f"),
@@ -678,6 +996,7 @@ def main() -> int:
         ev_threshold=float(config.get("ev_threshold", 0.02)),
         brier_gate=float(config.get("brier_gate", 0.24)),
         max_consecutive_losses=int(config.get("max_consecutive_losses", 3)),
+        max_pm_spread=float(config.get("max_pm_spread", 0.20)),
         signal_csv_path=str(config.get("signal_csv_path", "data/trade_signals.csv")),
         trade_alerts_enabled=trade_alerts_enabled,
         trade_alert_provider=trade_alert_provider,
@@ -687,6 +1006,11 @@ def main() -> int:
         trade_alert_only_actionable=trade_alert_only_actionable,
         trade_alert_min_interval_seconds=trade_alert_min_interval_seconds,
         trade_alert_dedupe_by_bucket=trade_alert_dedupe_by_bucket,
+        # Phase 5
+        paper_trading_enabled=paper_trading_enabled,
+        paper_trades_csv_path=paper_trades_csv_path,
+        paper_fill_config=paper_fill_config,
+        paper_risk_limits=paper_risk_limits,
     )
 
     try:

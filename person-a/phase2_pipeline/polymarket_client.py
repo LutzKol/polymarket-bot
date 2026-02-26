@@ -229,6 +229,74 @@ def resolve_btc_5m_yes_token(
     return None
 
 
+def fetch_market_resolution(
+    slug: str,
+    gamma_base_url: str = "https://gamma-api.polymarket.com",
+    timeout_seconds: float = 5.0,
+) -> Optional[dict]:
+    """Check if a BTC 5m market has resolved via Gamma API.
+
+    Returns dict with keys: resolved, outcome_up, outcome_prices, closed_time.
+    Returns None if event/market not found.
+    """
+    try:
+        events = fetch_json(
+            f"{gamma_base_url.rstrip('/')}/events",
+            params={"slug": slug},
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception:
+        return None
+
+    if not isinstance(events, list) or len(events) == 0:
+        return None
+
+    event = events[0]
+    if not isinstance(event, dict):
+        return None
+
+    markets = event.get("markets", [])
+    if not isinstance(markets, list) or len(markets) == 0:
+        return None
+
+    market = markets[0]
+    if not isinstance(market, dict):
+        return None
+
+    closed = market.get("closed", False)
+    if not closed:
+        return {"resolved": False, "outcome_up": None, "outcome_prices": [], "closed_time": None}
+
+    outcome_prices = _decode_json_listish(market.get("outcomePrices", []))
+    closed_time = market.get("endDate") or market.get("closedTime") or ""
+
+    # Determine outcome: outcomePrices = ["1","0"] means first outcome won.
+    # For BTC up/down markets, outcomes[0] is typically "Up".
+    outcome_up: Optional[bool] = None
+    if len(outcome_prices) >= 2:
+        try:
+            p0 = float(outcome_prices[0])
+            p1 = float(outcome_prices[1])
+            if p0 == 1.0 and p1 == 0.0:
+                outcome_up = True  # "Up" won
+            elif p0 == 0.0 and p1 == 1.0:
+                outcome_up = False  # "Down" won
+            # else: unclear resolution, leave as None
+        except (TypeError, ValueError):
+            pass
+
+    if outcome_up is None:
+        # Closed but no clear binary outcome
+        return {"resolved": False, "outcome_up": None, "outcome_prices": outcome_prices, "closed_time": closed_time}
+
+    return {
+        "resolved": True,
+        "outcome_up": outcome_up,
+        "outcome_prices": outcome_prices,
+        "closed_time": closed_time,
+    }
+
+
 def fetch_polymarket_book(base_url: str, token_id: str, timeout_seconds: float = 10.0) -> dict:
     query = urlencode({"token_id": token_id})
     url = f"{base_url.rstrip('/')}/book?{query}"

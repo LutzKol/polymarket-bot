@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Callable, Optional
 from urllib.request import Request, urlopen
 
+from phase2_pipeline.paper_trading import PaperTrade
 from phase2_pipeline.trade_signal import TradeSignal
 
 
@@ -44,6 +45,90 @@ def format_trade_signal_alert(signal: TradeSignal) -> str:
         f"p_model={signal.model_probability:.4f} p_mkt={signal.market_probability:.4f} | "
         f"ev={signal.ev:.4f} | size=${signal.suggested_size_usdc:.2f} | "
         f"risk_ok={signal.risk_checks_passed} | reason={signal.reason or '-'}"
+    )
+
+
+def format_paper_trade_opened(trade: PaperTrade) -> str:
+    """Rich emoji-formatted alert for a newly opened paper trade."""
+    arrow = "\u2191" if trade.direction == "UP" else "\u2193"
+    side = "YES" if trade.direction == "UP" else "NO"
+    return (
+        f"\U0001f7e2 PAPER TRADE OPENED\n"
+        f"{arrow} Direction: {trade.direction} ({side})\n"
+        f"Entry: {trade.entry_price:.4f} | Size: ${trade.size_usdc:.2f}\n"
+        f"Model: {trade.model_probability * 100:.1f}% | "
+        f"Market: {trade.market_probability_entry * 100:.1f}%\n"
+        f"EV: {trade.ev_entry:+.3f} | Bucket: #{trade.event_id}"
+    )
+
+
+def format_paper_trade_resolved(trade: PaperTrade, summary: dict) -> str:
+    """Rich emoji-formatted alert for a resolved paper trade."""
+    if trade.won:
+        header = "\u2705 PAPER TRADE WON"
+    else:
+        header = "\u274c PAPER TRADE LOST"
+    arrow = "\u2191" if trade.direction == "UP" else "\u2193"
+    side = "YES" if trade.direction == "UP" else "NO"
+    exit_price = trade.exit_price if trade.exit_price is not None else 0.0
+    pnl = trade.pnl_usdc if trade.pnl_usdc is not None else 0.0
+    ret = trade.return_pct if trade.return_pct is not None else 0.0
+    bankroll = summary.get("ending_bankroll_usdc", 0.0)
+    wins = summary.get("wins", 0)
+    losses = summary.get("losses", 0)
+    total = wins + losses
+    win_rate = (wins / total * 100) if total > 0 else 0.0
+    return (
+        f"{header}\n"
+        f"{arrow} Direction: {trade.direction} ({side})\n"
+        f"Entry: {trade.entry_price:.4f} \u2192 Exit: {exit_price:.4f}\n"
+        f"PnL: {pnl:+.2f} ({ret:+.1%})\n"
+        f"Bankroll: ${bankroll:,.2f}\n"
+        f"Record: {wins}W/{losses}L ({win_rate:.1f}%)"
+    )
+
+
+def format_daily_reset(day_summary: dict, overall_summary: dict) -> str:
+    """Rich emoji-formatted alert for daily reset at 00:00 UTC."""
+    day = day_summary["day"]
+    trades = day_summary["trades"]
+    wins = day_summary["wins"]
+    losses = day_summary["losses"]
+    win_rate = day_summary["win_rate"] * 100
+    pnl = day_summary["pnl_usdc"]
+    pnl_emoji = "\U0001f4c8" if pnl >= 0 else "\U0001f4c9"
+
+    total_wins = overall_summary.get("wins", 0)
+    total_losses = overall_summary.get("losses", 0)
+    total_trades = total_wins + total_losses
+    overall_wr = (total_wins / total_trades * 100) if total_trades > 0 else 0.0
+    bankroll = overall_summary.get("ending_bankroll_usdc", 0.0)
+    total_pnl = overall_summary.get("total_pnl_usdc", 0.0)
+
+    return (
+        f"\U0001f504 DAILY RESET — {day}\n"
+        f"\n"
+        f"{pnl_emoji} Day: {wins}W/{losses}L ({trades} trades)\n"
+        f"Day PnL: ${pnl:+,.2f} | Win Rate: {win_rate:.1f}%\n"
+        f"\n"
+        f"Overall: {total_wins}W/{total_losses}L ({total_trades} trades)\n"
+        f"Total PnL: ${total_pnl:+,.2f} | Win Rate: {overall_wr:.1f}%\n"
+        f"Bankroll: ${bankroll:,.2f}"
+    )
+
+
+def format_kill_switch(reason: str, summary: dict) -> str:
+    """Format a kill-switch activation alert for Telegram/Discord."""
+    wins = summary.get("wins", 0)
+    losses = summary.get("losses", 0)
+    total = wins + losses
+    bankroll = summary.get("ending_bankroll_usdc", 0.0)
+    return (
+        f"\U0001f6a8 KILL-SWITCH ACTIVATED\n"
+        f"Reason: {reason}\n"
+        f"Record: {wins}W/{losses}L ({total} trades)\n"
+        f"Bankroll: ${bankroll:,.2f}\n"
+        f"\u26a0\ufe0f Paper trading paused \u2014 manual review required"
     )
 
 
