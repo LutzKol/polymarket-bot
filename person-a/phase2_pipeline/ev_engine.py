@@ -16,8 +16,7 @@ from phase2_pipeline.trade_signal import TradeSignal
 class ModelLoader:
     """Load a logistic regression model and predict P(UP)."""
 
-    def __init__(self, model_path: str, feature_columns: list[str]):
-        self.feature_columns = feature_columns
+    def __init__(self, model_path: str, feature_columns: list[str] | None = None):
         self._model = None
         self._weights: Optional[list[float]] = None
 
@@ -30,11 +29,18 @@ class ModelLoader:
             with path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
             self._weights = [float(w) for w in data["weights"]]
+            # Prefer feature_columns embedded in the model file
+            if "feature_columns" in data and not feature_columns:
+                feature_columns = data["feature_columns"]
         elif suffix in (".pkl", ".joblib"):
             with path.open("rb") as f:
                 self._model = pickle.load(f)
         else:
             raise ValueError(f"Unsupported model format: {suffix}")
+
+        if not feature_columns:
+            raise ValueError("feature_columns must be provided or embedded in model file")
+        self.feature_columns = feature_columns
 
     def predict_proba(self, features: dict) -> Optional[float]:
         """Return P(UP) given a feature dict, or None if features are missing."""
@@ -65,10 +71,24 @@ class EVCalculator:
         self.ev_threshold = ev_threshold
         self.fee = fee
 
-    def calculate(self, model_prob: float, market_prob: float) -> tuple[float, str]:
-        """Return (ev, direction). Direction is 'NONE' if EV < threshold."""
-        ev_yes = model_prob * (1 - self.fee) - market_prob
-        ev_no = (1 - model_prob) * (1 - self.fee) - (1 - market_prob)
+    def calculate(
+        self,
+        model_prob: float,
+        market_prob: float,
+        cost_yes: float | None = None,
+        cost_no: float | None = None,
+    ) -> tuple[float, str]:
+        """Return (ev, direction). Direction is 'NONE' if EV < threshold.
+
+        When cost_yes / cost_no are provided (from orderbook best ask / 1-best_bid),
+        EV is calculated against the actual entry cost rather than the mid probability.
+        This prevents entering trades where the spread destroys the edge.
+        """
+        price_yes = cost_yes if cost_yes is not None else market_prob
+        price_no = cost_no if cost_no is not None else (1 - market_prob)
+
+        ev_yes = model_prob * (1 - self.fee) - price_yes
+        ev_no = (1 - model_prob) * (1 - self.fee) - price_no
 
         if ev_yes >= ev_no:
             best_ev = ev_yes
@@ -81,6 +101,32 @@ class EVCalculator:
             return best_ev, "NONE"
 
         return best_ev, direction
+
+    def calculate_limit_order(
+        self,
+        model_prob: float,
+        edge_buffer: float = 0.0,
+    ) -> tuple[float, str, float]:
+        """Compute limit price that meets EV threshold for a limit order.
+
+        Returns (ev, direction, limit_price).
+        Direction is 'NONE' if no viable limit price exists.
+        """
+        # YES side: limit_yes = model_prob * (1 - fee) - ev_threshold - edge_buffer
+        limit_yes = model_prob * (1 - self.fee) - self.ev_threshold - edge_buffer
+        # NO side: limit_no = (1 - model_prob) * (1 - fee) - ev_threshold - edge_buffer
+        limit_no = (1 - model_prob) * (1 - self.fee) - self.ev_threshold - edge_buffer
+
+        # EV at the limit price equals ev_threshold + edge_buffer by construction
+        ev_yes = model_prob * (1 - self.fee) - limit_yes if limit_yes > 0 else -1.0
+        ev_no = (1 - model_prob) * (1 - self.fee) - limit_no if limit_no > 0 else -1.0
+
+        if ev_yes >= ev_no and limit_yes > 0 and limit_yes < 1:
+            return round(ev_yes, 6), "UP", round(limit_yes, 4)
+        elif limit_no > 0 and limit_no < 1:
+            return round(ev_no, 6), "DOWN", round(limit_no, 4)
+
+        return 0.0, "NONE", 0.0
 
 
 class KellySizer:
@@ -96,8 +142,13 @@ class KellySizer:
         direction: str,
         bankroll: float,
         fee: float = 0.02,
+        cost_override: float | None = None,
     ) -> tuple[float, float]:
-        """Return (kelly_fraction, size_usdc). Returns (0, 0) for no edge."""
+        """Return (kelly_fraction, size_usdc). Returns (0, 0) for no edge.
+
+        When cost_override is provided (e.g. a limit price), it replaces the
+        market_prob-derived cost for Kelly sizing.
+        """
         if direction == "NONE" or bankroll <= 0:
             return 0.0, 0.0
 
@@ -107,6 +158,9 @@ class KellySizer:
         else:
             p = 1.0 - model_prob
             cost = 1.0 - market_prob
+
+        if cost_override is not None:
+            cost = cost_override
 
         if cost <= 0 or cost >= 1:
             return 0.0, 0.0
@@ -195,17 +249,40 @@ def evaluate_signal(
     ev_calculator: EVCalculator,
     kelly_sizer: KellySizer,
     oracle_stale: bool = False,
+    cost_yes: float | None = None,
+    cost_no: float | None = None,
+    limit_order_mode: bool = False,
+    limit_edge_buffer: float = 0.0,
 ) -> TradeSignal:
-    """Top-level convenience: features → TradeSignal."""
+    """Top-level convenience: features → TradeSignal.
+
+    When limit_order_mode is True, computes a limit price where the EV meets
+    threshold and sizes via Kelly at that limit price instead of market mid.
+    """
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     model_prob = model.predict_proba(features)
+    limit_price: float | None = None
 
     if model_prob is not None:
-        ev, direction = ev_calculator.calculate(model_prob, market_prob)
-        kelly_frac, size_usdc = kelly_sizer.size(
-            model_prob, market_prob, direction, bankroll, ev_calculator.fee
-        )
+        if limit_order_mode:
+            ev, direction, limit_price = ev_calculator.calculate_limit_order(
+                model_prob, edge_buffer=limit_edge_buffer,
+            )
+            if direction != "NONE" and limit_price is not None and limit_price > 0:
+                kelly_frac, size_usdc = kelly_sizer.size(
+                    model_prob, market_prob, direction, bankroll,
+                    ev_calculator.fee, cost_override=limit_price,
+                )
+            else:
+                kelly_frac, size_usdc = 0.0, 0.0
+        else:
+            ev, direction = ev_calculator.calculate(
+                model_prob, market_prob, cost_yes=cost_yes, cost_no=cost_no,
+            )
+            kelly_frac, size_usdc = kelly_sizer.size(
+                model_prob, market_prob, direction, bankroll, ev_calculator.fee
+            )
     else:
         ev, direction = 0.0, "NONE"
         kelly_frac, size_usdc = 0.0, 0.0
@@ -224,4 +301,5 @@ def evaluate_signal(
         reason=reason,
         bankroll_usdc=bankroll,
         brier_score=risk_manager.rolling_brier,
+        limit_price=limit_price if limit_order_mode else None,
     )

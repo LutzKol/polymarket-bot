@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
+import hashlib
+
 from phase2_pipeline.ev_engine import RiskManager
 from phase2_pipeline.trade_signal import TradeSignal
 
@@ -199,6 +201,7 @@ class PaperTradingEngine:
         self._daily_start_equity: dict[str, float] = {}
         self._cooldown_until_epoch: Optional[float] = None
         self._cooldown_trigger_count: int = 0
+        self.pending_limit_orders: dict[str, dict] = {}  # event_id -> order info
 
     def _append_equity_point(self) -> None:
         self._equity_curve.append(round(self.cash_usdc, 6))
@@ -477,6 +480,129 @@ class PaperTradingEngine:
             "start_equity": round(self._daily_start_equity.get(day_key, 0.0), 2),
             "end_equity": round(self.cash_usdc, 2),
         }
+
+    def has_pending_limit_order(self, event_id: str) -> bool:
+        """Return True if there's a pending limit order for this event."""
+        return event_id in self.pending_limit_orders
+
+    def post_limit_order(
+        self,
+        signal: TradeSignal,
+        event_id: str,
+        limit_price: float,
+    ) -> Optional[dict]:
+        """Queue a limit order. Returns order info dict or None if rejected."""
+        self.last_reject_reason = ""
+        if signal.direction not in ("UP", "DOWN"):
+            self.last_reject_reason = "direction_none"
+            return None
+        if not signal.risk_checks_passed:
+            self.last_reject_reason = "signal_risk_checks_failed"
+            return None
+        if signal.suggested_size_usdc <= 0:
+            self.last_reject_reason = "size_nonpositive"
+            return None
+        if limit_price <= 0 or limit_price >= 1:
+            self.last_reject_reason = "invalid_limit_price"
+            return None
+
+        policy_reason = self._policy_reject_reason(signal)
+        if policy_reason:
+            self.last_reject_reason = policy_reason
+            return None
+
+        order = {
+            "event_id": event_id,
+            "direction": signal.direction,
+            "limit_price": limit_price,
+            "size_usdc": round(float(signal.suggested_size_usdc), 2),
+            "model_probability": float(signal.model_probability),
+            "market_probability": float(signal.market_probability),
+            "ev": float(signal.ev),
+            "posted_at": signal.timestamp or _utc_now_iso(),
+            "signal": signal,
+        }
+        self.pending_limit_orders[event_id] = order
+        return order
+
+    def try_fill_limit_order(
+        self,
+        event_id: str,
+        fill_rate: float = 0.60,
+    ) -> Optional[PaperTrade]:
+        """Deterministically check if a pending limit order fills.
+
+        Fill is based on hash(event_id) for reproducibility.
+        Returns PaperTrade if filled, None otherwise.
+        """
+        if event_id not in self.pending_limit_orders:
+            return None
+
+        order = self.pending_limit_orders[event_id]
+
+        # Deterministic fill: hash(event_id) % 100 < fill_rate * 100
+        h = int(hashlib.sha256(event_id.encode()).hexdigest(), 16)
+        if (h % 100) >= int(fill_rate * 100):
+            return None  # Not filled
+
+        # Fill the order — create a PaperTrade at the limit price
+        del self.pending_limit_orders[event_id]
+
+        limit_price = order["limit_price"]
+        size_usdc = order["size_usdc"]
+        direction = order["direction"]
+        signal = order["signal"]
+
+        entry_fee_rate = self.fill_simulator.entry_fee_rate(limit_price)
+        total_cash_needed = size_usdc * (1.0 + entry_fee_rate)
+        if total_cash_needed > self.cash_usdc:
+            self.last_reject_reason = "insufficient_cash"
+            return None
+
+        shares = round(size_usdc / limit_price, 8)
+        entry_fee_usdc = round(size_usdc * entry_fee_rate, 6)
+
+        trade = PaperTrade(
+            trade_id=self._next_trade_id,
+            event_id=event_id,
+            opened_at=_utc_now_iso(),
+            closed_at=None,
+            status="OPEN",
+            direction=direction,
+            contract_side=self._contract_side(direction),
+            entry_price=limit_price,
+            exit_price=None,
+            size_usdc=size_usdc,
+            shares=shares,
+            entry_fee_usdc=entry_fee_usdc,
+            exit_fee_usdc=0.0,
+            payout_usdc=0.0,
+            pnl_usdc=None,
+            return_pct=None,
+            won=None,
+            resolution_outcome_up=None,
+            model_probability=order["model_probability"],
+            market_probability_entry=order["market_probability"],
+            ev_entry=order["ev"],
+            reason=signal.reason or "",
+        )
+        self._next_trade_id += 1
+        self.open_trades[trade.trade_id] = trade
+
+        day_key = _utc_day_key_from_epoch(_parse_iso_to_epoch(trade.opened_at))
+        self._ensure_day_tracking(day_key)
+        self._daily_trade_counts[day_key] += 1
+
+        self.cash_usdc = round(self.cash_usdc - size_usdc - entry_fee_usdc, 6)
+        self._append_equity_point()
+        return trade
+
+    def cancel_limit_order(self, event_id: str) -> bool:
+        """Cancel a pending limit order. Returns True if an order was cancelled."""
+        if event_id in self.pending_limit_orders:
+            del self.pending_limit_orders[event_id]
+            return True
+        return False
 
     def reset_cooldown(self) -> None:
         """Clear consecutive-loss cooldown (called on daily reset)."""

@@ -22,7 +22,8 @@ DEFAULTS = {
     "max_oracle_age_seconds": 300.0,
     # Phase 4: EV-Engine
     "model_path": "",
-    "model_feature_columns": ["oracle_lag_pct", "sigma_short", "momentum_30s"],
+    "model_feature_columns": None,  # Read from model file when not specified
+    "max_pm_spread": 0.20,  # Skip trades when Polymarket spread exceeds this
     "bankroll_usdc": 1000.0,
     "max_fraction_per_trade": 0.02,
     "ev_threshold": 0.02,
@@ -49,6 +50,10 @@ DEFAULTS = {
     "paper_max_trades_per_day": 20,
     "paper_cooldown_after_consecutive_losses": 3,
     "paper_cooldown_minutes": 30.0,
+    # Limit order mode
+    "limit_order_mode": False,
+    "limit_edge_buffer": 0.0,
+    "limit_fill_rate": 0.60,
 }
 
 FLOAT_FIELDS = {
@@ -62,12 +67,15 @@ FLOAT_FIELDS = {
     "max_fraction_per_trade",
     "ev_threshold",
     "brier_gate",
+    "max_pm_spread",
     "trade_alert_min_interval_seconds",
     "paper_fill_half_spread_bps",
     "paper_fill_slippage_bps",
     "paper_fill_latency_bps",
     "paper_max_daily_loss_fraction",
     "paper_cooldown_minutes",
+    "limit_edge_buffer",
+    "limit_fill_rate",
 }
 
 POSITIVE_FLOAT_FIELDS = {
@@ -91,6 +99,7 @@ BOOL_FIELDS = {
     "trade_alert_dedupe_by_bucket",
     "paper_trading_enabled",
     "paper_fill_use_variable_fees",
+    "limit_order_mode",
 }
 
 

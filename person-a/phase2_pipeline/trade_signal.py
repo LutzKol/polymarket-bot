@@ -19,6 +19,7 @@ class TradeSignal:
     reason: str  # "" or e.g. "oracle_stale;brier_gate_exceeded"
     bankroll_usdc: float
     brier_score: Optional[float] = None
+    limit_price: Optional[float] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -37,4 +38,5 @@ class TradeSignal:
             "reason",
             "bankroll_usdc",
             "brier_score",
+            "limit_price",
         ]
