@@ -1,6 +1,14 @@
 .env
+.DS_Store
 __pycache__/
+.pycache_local/
 *.pyc
+config.json
 btc_markets.json
 *.pid
 *.log
+logs/
+data/
+*.zip
+*.bundle
+polymarket-bot/
