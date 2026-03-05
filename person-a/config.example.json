@@ -32,5 +32,21 @@
     "telegram_chat_id": "YOUR_TELEGRAM_CHAT_ID",
     "trade_alert_only_actionable": true,
     "trade_alert_min_interval_seconds": 30,
-    "trade_alert_dedupe_by_bucket": true
+    "trade_alert_dedupe_by_bucket": true,
+
+    "paper_trading_enabled": false,
+    "paper_trades_csv_path": "data/paper_trades.csv",
+    "paper_fill_half_spread_bps": 5.0,
+    "paper_fill_slippage_bps": 10.0,
+    "paper_fill_latency_bps": 5.0,
+    "paper_fill_use_variable_fees": true,
+    "paper_max_daily_loss_fraction": 0.08,
+    "paper_max_trades_per_day": 20,
+    "paper_cooldown_after_consecutive_losses": 3,
+    "paper_cooldown_minutes": 30.0,
+
+    "allowed_directions": ["UP", "DOWN"],
+    "min_model_prob_up": 0.50,
+    "max_entry_price": 0.65,
+    "max_pm_spread": 0.20
 }
