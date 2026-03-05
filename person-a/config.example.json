@@ -47,6 +47,6 @@
 
     "allowed_directions": ["UP", "DOWN"],
     "min_model_prob_up": 0.50,
-    "max_entry_price": 0.65,
+    "max_entry_price": 0.48,
     "max_pm_spread": 0.20
 }
