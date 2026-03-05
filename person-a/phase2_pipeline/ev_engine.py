@@ -132,8 +132,25 @@ class EVCalculator:
 class KellySizer:
     """Kelly criterion position sizing with a hard cap."""
 
+    STREAK_HARD_CAP = 0.05  # Never exceed 5% regardless of streak
+
     def __init__(self, max_fraction: float = 0.02):
+        self.base_max_fraction = max_fraction
         self.max_fraction = max_fraction
+
+    def adjust_for_streak(self, consecutive_wins: int) -> float:
+        """Boost max_fraction after 3+ consecutive wins. Returns new max_fraction."""
+        if consecutive_wins >= 5:
+            multiplier = 2.0
+        elif consecutive_wins >= 3:
+            multiplier = 1.5
+        else:
+            multiplier = 1.0
+        self.max_fraction = min(
+            self.base_max_fraction * multiplier,
+            self.STREAK_HARD_CAP,
+        )
+        return self.max_fraction
 
     def size(
         self,
@@ -253,6 +270,8 @@ def evaluate_signal(
     cost_no: float | None = None,
     limit_order_mode: bool = False,
     limit_edge_buffer: float = 0.0,
+    allowed_directions: tuple[str, ...] = ("UP", "DOWN"),
+    min_model_prob_up: float = 0.0,
 ) -> TradeSignal:
     """Top-level convenience: features → TradeSignal.
 
@@ -264,11 +283,19 @@ def evaluate_signal(
     model_prob = model.predict_proba(features)
     limit_price: float | None = None
 
+    def _filter_direction(d: str, mp: float) -> str:
+        if d not in allowed_directions:
+            return "NONE"
+        if d == "UP" and mp < min_model_prob_up:
+            return "NONE"
+        return d
+
     if model_prob is not None:
         if limit_order_mode:
             ev, direction, limit_price = ev_calculator.calculate_limit_order(
                 model_prob, edge_buffer=limit_edge_buffer,
             )
+            direction = _filter_direction(direction, model_prob)
             if direction != "NONE" and limit_price is not None and limit_price > 0:
                 kelly_frac, size_usdc = kelly_sizer.size(
                     model_prob, market_prob, direction, bankroll,
@@ -280,6 +307,7 @@ def evaluate_signal(
             ev, direction = ev_calculator.calculate(
                 model_prob, market_prob, cost_yes=cost_yes, cost_no=cost_no,
             )
+            direction = _filter_direction(direction, model_prob)
             kelly_frac, size_usdc = kelly_sizer.size(
                 model_prob, market_prob, direction, bankroll, ev_calculator.fee
             )

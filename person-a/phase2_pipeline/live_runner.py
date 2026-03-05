@@ -44,6 +44,7 @@ try:
     from phase2_pipeline.signal_alerts import (
         SignalAlertConfig,
         SignalAlertNotifier,
+        TelegramCommandPoller,
         format_daily_reset,
         format_kill_switch,
         format_paper_trade_opened,
@@ -79,6 +80,7 @@ except ModuleNotFoundError:
     from phase2_pipeline.signal_alerts import (
         SignalAlertConfig,
         SignalAlertNotifier,
+        TelegramCommandPoller,
         format_daily_reset,
         format_kill_switch,
         format_paper_trade_opened,
@@ -153,6 +155,14 @@ class Phase2LiveRunner:
         paper_trades_csv_path: str = "data/paper_trades.csv",
         paper_fill_config: Optional[FillConfig] = None,
         paper_risk_limits: Optional[PaperRiskLimits] = None,
+        # Direction filter: which directions to trade ("UP", "DOWN", or both)
+        allowed_directions: tuple[str, ...] = ("UP", "DOWN"),
+        # Minimum model probability to take UP trades
+        min_model_prob_up: float = 0.0,
+        # Max entry price filter: skip trades with bad risk/reward
+        max_entry_price: float = 0.75,
+        # Stop-loss: exit early if market moves this fraction against entry
+        stop_loss_pct: float = 0.25,
         # Limit order mode
         limit_order_mode: bool = False,
         limit_edge_buffer: float = 0.0,
@@ -257,6 +267,10 @@ class Phase2LiveRunner:
         self._bucket_start_oracle_price: Optional[float] = None
         self._current_day_key: Optional[str] = None
 
+        self.allowed_directions = allowed_directions
+        self.min_model_prob_up = min_model_prob_up
+        self.max_entry_price = max_entry_price
+        self.stop_loss_pct = stop_loss_pct
         self.limit_order_mode = limit_order_mode
         self.limit_edge_buffer = limit_edge_buffer
         self.limit_fill_rate = limit_fill_rate
@@ -267,8 +281,22 @@ class Phase2LiveRunner:
                 fill_simulator=FillSimulator(paper_fill_config or FillConfig()),
                 risk_manager=self.risk_manager if hasattr(self, "risk_manager") else None,
                 risk_limits=paper_risk_limits or PaperRiskLimits(),
+                max_entry_price=max_entry_price,
             )
             self.paper_trading_enabled = True
+
+        # Telegram /pnl command poller
+        self.telegram_cmd_poller: Optional[TelegramCommandPoller] = None
+        if (
+            alert_cfg.provider.strip().lower() == "telegram"
+            and alert_cfg.telegram_bot_token.strip()
+            and alert_cfg.telegram_chat_id.strip()
+        ):
+            self.telegram_cmd_poller = TelegramCommandPoller(
+                bot_token=alert_cfg.telegram_bot_token,
+                chat_id=alert_cfg.telegram_chat_id,
+                paper_trades_csv_path=paper_trades_csv_path,
+            )
 
     def _log(self, message: str) -> None:
         print(f"[{_utc_iso()}] {message}")
@@ -326,6 +354,18 @@ class Phase2LiveRunner:
             writer.writerow([row[col] for col in PaperTrade.csv_columns()])
             f.flush()
 
+    def _get_consecutive_wins(self) -> int:
+        """Count consecutive wins from most recent closed trades."""
+        if self.paper_engine is None:
+            return 0
+        streak = 0
+        for trade in reversed(self.paper_engine.closed_trades):
+            if trade.won is True:
+                streak += 1
+            else:
+                break
+        return streak
+
     def _has_open_paper_trade(self) -> bool:
         return self.paper_engine is not None and self.paper_engine.has_open_trades()
 
@@ -369,6 +409,54 @@ class Phase2LiveRunner:
                 self._resolution_retry_count = 0
                 return None
 
+        return None
+
+    async def _check_stop_loss(self) -> Optional[PaperTrade]:
+        """Check if any open trade hit the stop-loss threshold and exit early."""
+        if self.paper_engine is None or not self.paper_engine.open_trades:
+            return None
+
+        pm_mid = self.state.pm_mid_prob
+        if pm_mid is None:
+            return None
+
+        for trade_id, trade in list(self.paper_engine.open_trades.items()):
+            entry = trade.entry_price
+            # For YES: losing = market price dropping. Stop if price fell by stop_loss_pct of entry.
+            # For NO: entry_price is 1-market_prob at entry. Losing = market_prob rising.
+            if trade.contract_side == "YES":
+                current_value = pm_mid
+                stop_price = entry * (1.0 - self.stop_loss_pct)
+                triggered = current_value <= stop_price
+            else:
+                # NO contract: we bought at (1 - market_prob). We lose if market_prob rises.
+                current_value = 1.0 - pm_mid
+                stop_price = entry * (1.0 - self.stop_loss_pct)
+                triggered = current_value <= stop_price
+
+            if triggered:
+                self._log(
+                    f"[STOP-LOSS] trade #{trade_id} hit stop-loss: "
+                    f"entry={entry:.4f} current={current_value:.4f} "
+                    f"stop={stop_price:.4f} ({self.stop_loss_pct*100:.0f}%)"
+                )
+                try:
+                    closed_trade = self.paper_engine.early_exit_trade(
+                        trade_id=trade_id,
+                        current_market_price=pm_mid,
+                    )
+                    self._log_paper_trade(closed_trade)
+                    self._log(
+                        f"[STOP-LOSS] exited trade #{closed_trade.trade_id}: "
+                        f"pnl=${closed_trade.pnl_usdc:+.2f}"
+                    )
+                    await self._maybe_alert_paper_trade(closed_trade)
+                    # Clear pending resolution since we exited early
+                    self._pending_resolution_slug = None
+                    self._resolution_retry_count = 0
+                    return closed_trade
+                except Exception as exc:
+                    self._log(f"[STOP-LOSS] error exiting trade: {exc}")
         return None
 
     async def _resolve_trade_with_outcome(self, outcome_up: bool, source: str) -> Optional[PaperTrade]:
@@ -571,6 +659,16 @@ class Phase2LiveRunner:
                     cost_yes = float(_ask) if _ask is not None else None
                     cost_no = (1.0 - float(_bid)) if _bid is not None else None
 
+                    # Adjust position size for win streaks
+                    wins = self._get_consecutive_wins()
+                    boosted_frac = self.kelly_sizer.adjust_for_streak(wins)
+                    self.risk_manager.max_fraction = boosted_frac
+                    if wins >= 3:
+                        self._log(
+                            f"[STREAK] {wins} consecutive wins — "
+                            f"max_fraction boosted to {boosted_frac:.3f}"
+                        )
+
                     signal = evaluate_signal(
                         features=features,
                         model=self.model_loader,
@@ -584,6 +682,8 @@ class Phase2LiveRunner:
                         cost_no=cost_no,
                         limit_order_mode=self.limit_order_mode,
                         limit_edge_buffer=self.limit_edge_buffer,
+                        allowed_directions=self.allowed_directions,
+                        min_model_prob_up=self.min_model_prob_up,
                     )
                     self._log_signal(signal)
                     await self._maybe_alert_signal(signal)
@@ -620,6 +720,10 @@ class Phase2LiveRunner:
                         old_event_id = str(self._current_bucket_id)
                         if self.paper_engine.cancel_limit_order(old_event_id):
                             self._log(f"[LIMIT] cancelled unfilled order for bucket={self._current_bucket_id}")
+
+                # Stop-loss check on every tick
+                if self._has_open_paper_trade() and self.stop_loss_pct > 0:
+                    await self._check_stop_loss()
 
                 # Poll for Polymarket resolution if pending
                 if self._pending_resolution_slug is not None and self._has_open_paper_trade():
@@ -828,6 +932,10 @@ class Phase2LiveRunner:
             self._log("[FUNDING] enabled (Binance premiumIndex poller)")
         else:
             self._log("[FUNDING] disabled")
+
+        if self.telegram_cmd_poller is not None:
+            tasks.append(self.telegram_cmd_poller.run(self._get_stop_event()))
+            self._log("[TELEGRAM-CMD] /pnl command poller enabled")
 
         await asyncio.gather(*tasks)
 
@@ -1077,6 +1185,12 @@ def main() -> int:
         paper_trades_csv_path=paper_trades_csv_path,
         paper_fill_config=paper_fill_config,
         paper_risk_limits=paper_risk_limits,
+        # Direction filter
+        allowed_directions=tuple(config.get("allowed_directions", ["UP", "DOWN"])),
+        min_model_prob_up=float(config.get("min_model_prob_up", 0.0)),
+        max_entry_price=float(config.get("max_entry_price", 1.0)),
+        # Stop-loss
+        stop_loss_pct=float(config.get("stop_loss_pct", 0.40)),
         # Limit order mode
         limit_order_mode=bool(config.get("limit_order_mode", False)),
         limit_edge_buffer=float(config.get("limit_edge_buffer", 0.0)),

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import csv
 import json
+import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Optional
 from urllib.request import Request, urlopen
 
@@ -62,9 +66,15 @@ def format_paper_trade_opened(trade: PaperTrade) -> str:
     )
 
 
+def _is_early_exit(trade: PaperTrade) -> bool:
+    return trade.reason.startswith("early_exit|")
+
+
 def format_paper_trade_resolved(trade: PaperTrade, summary: dict) -> str:
     """Rich emoji-formatted alert for a resolved paper trade."""
-    if trade.won:
+    if _is_early_exit(trade):
+        header = "\u26a0\ufe0f STOP-LOSS EXIT"
+    elif trade.won:
         header = "\u2705 PAPER TRADE WON"
     else:
         header = "\u274c PAPER TRADE LOST"
@@ -243,4 +253,142 @@ class SignalAlertNotifier:
         self._last_sent_at = now
         self._last_signature = sig
         return True, "sent"
+
+
+def format_pnl_summary(csv_path: str) -> str:
+    """Read paper_trades.csv and return a formatted P&L summary string."""
+    path = Path(csv_path)
+    if not path.exists():
+        return "\u2139\ufe0f No paper trades recorded yet."
+
+    trades: list[dict] = []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            trades.append(row)
+
+    # Only consider resolved trades (won is not empty)
+    resolved = [t for t in trades if t.get("won", "") not in ("", "None")]
+    if not resolved:
+        return "\u2139\ufe0f No resolved paper trades yet."
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    total_wins = 0
+    total_losses = 0
+    total_pnl = 0.0
+    today_wins = 0
+    today_losses = 0
+    today_pnl = 0.0
+
+    for t in resolved:
+        pnl = float(t.get("pnl_usdc", 0) or 0)
+        won = t.get("won", "").strip().lower() == "true"
+        if won:
+            total_wins += 1
+        else:
+            total_losses += 1
+        total_pnl += pnl
+
+        # Check if trade was closed today
+        ts = t.get("closed_at", "") or t.get("opened_at", "")
+        if ts and ts[:10] == today_str:
+            if won:
+                today_wins += 1
+            else:
+                today_losses += 1
+            today_pnl += pnl
+
+    total_trades = total_wins + total_losses
+    total_wr = (total_wins / total_trades * 100) if total_trades > 0 else 0.0
+    today_total = today_wins + today_losses
+    today_wr = (today_wins / today_total * 100) if today_total > 0 else 0.0
+
+    pnl_emoji = "\U0001f4c8" if total_pnl >= 0 else "\U0001f4c9"
+    today_emoji = "\U0001f4c8" if today_pnl >= 0 else "\U0001f4c9"
+
+    lines = [
+        f"\U0001f4ca P&L Summary",
+        f"",
+        f"{today_emoji} Today ({today_str}):",
+        f"  {today_wins}W / {today_losses}L ({today_total} trades, {today_wr:.1f}%)",
+        f"  PnL: ${today_pnl:+,.2f}",
+        f"",
+        f"{pnl_emoji} Overall:",
+        f"  {total_wins}W / {total_losses}L ({total_trades} trades, {total_wr:.1f}%)",
+        f"  PnL: ${total_pnl:+,.2f}",
+    ]
+    return "\n".join(lines)
+
+
+logger = logging.getLogger(__name__)
+
+
+class TelegramCommandPoller:
+    """Polls Telegram getUpdates for /pnl commands and replies with P&L summary."""
+
+    def __init__(
+        self,
+        bot_token: str,
+        chat_id: str,
+        paper_trades_csv_path: str,
+        poll_seconds: float = 5.0,
+    ):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.paper_trades_csv_path = paper_trades_csv_path
+        self.poll_seconds = poll_seconds
+        self._last_update_id: int = 0
+
+    def _get_updates(self) -> list[dict]:
+        """Fetch new updates from Telegram using long-polling offset."""
+        url = (
+            f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
+            f"?offset={self._last_update_id + 1}&timeout=3"
+        )
+        req = Request(url, headers={"User-Agent": "polymarketbot-alerts/1.0"})
+        try:
+            with urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            if data.get("ok"):
+                return data.get("result", [])
+        except Exception as exc:
+            logger.debug("getUpdates error: %s", exc)
+        return []
+
+    def _handle_update(self, update: dict) -> None:
+        """Process a single Telegram update — reply to /pnl commands."""
+        self._last_update_id = max(self._last_update_id, update.get("update_id", 0))
+        msg = update.get("message", {})
+        text = (msg.get("text") or "").strip()
+        chat = msg.get("chat", {})
+        chat_id_str = str(chat.get("id", ""))
+
+        # Only respond to /pnl from the configured chat
+        if chat_id_str != self.chat_id:
+            return
+        if not text.lower().startswith("/pnl"):
+            return
+
+        summary = format_pnl_summary(self.paper_trades_csv_path)
+        try:
+            send_telegram_message(self.bot_token, self.chat_id, summary)
+        except Exception as exc:
+            logger.warning("Failed to send /pnl reply: %s", exc)
+
+    async def run(self, stop_event: asyncio.Event) -> None:
+        """Poll loop — runs until stop_event is set."""
+        logger.info("[TELEGRAM-CMD] Command poller started (poll every %.0fs)", self.poll_seconds)
+        while not stop_event.is_set():
+            try:
+                updates = await asyncio.to_thread(self._get_updates)
+                for update in updates:
+                    self._handle_update(update)
+            except Exception as exc:
+                logger.warning("[TELEGRAM-CMD] poll error: %s", exc)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=self.poll_seconds)
+                break  # stop_event was set
+            except asyncio.TimeoutError:
+                pass  # normal — loop again
 

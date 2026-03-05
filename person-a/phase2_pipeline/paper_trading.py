@@ -181,11 +181,13 @@ class PaperTradingEngine:
         fill_simulator: Optional[FillSimulator] = None,
         risk_manager: Optional[RiskManager] = None,
         risk_limits: Optional[PaperRiskLimits] = None,
+        max_entry_price: float = 1.0,
     ):
         if starting_bankroll_usdc <= 0:
             raise ValueError("starting_bankroll_usdc must be > 0")
         self.starting_bankroll_usdc = float(starting_bankroll_usdc)
         self.cash_usdc = float(starting_bankroll_usdc)
+        self.max_entry_price = max_entry_price
         self.fill_simulator = fill_simulator or FillSimulator()
         self.risk_manager = risk_manager
         self.risk_limits = risk_limits or PaperRiskLimits()
@@ -311,14 +313,24 @@ class PaperTradingEngine:
         if entry_price <= 0 or entry_price >= 1:
             self.last_reject_reason = "invalid_entry_price"
             return None
+        if entry_price > self.max_entry_price:
+            self.last_reject_reason = "entry_price_too_high"
+            return None
+
+        # Scale bet size by upside: more room to profit = bigger bet
+        # At entry 0.50: 2x base size, at 0.65: 1x base size
+        upside_ratio = (1.0 - entry_price) / entry_price
+        # Normalize: at entry 0.65 upside_ratio=0.538, at 0.50 it's 1.0
+        size_multiplier = max(1.0, min(2.0, upside_ratio / 0.538))
+        adjusted_size = round(float(signal.suggested_size_usdc) * size_multiplier, 2)
 
         entry_fee_rate = self.fill_simulator.entry_fee_rate(entry_price)
-        total_cash_needed = signal.suggested_size_usdc * (1.0 + entry_fee_rate)
+        total_cash_needed = adjusted_size * (1.0 + entry_fee_rate)
         if total_cash_needed > self.cash_usdc:
             self.last_reject_reason = "insufficient_cash"
             return None
 
-        size_usdc = round(float(signal.suggested_size_usdc), 2)
+        size_usdc = adjusted_size
         shares = round(size_usdc / entry_price, 8)
         entry_fee_usdc = round(size_usdc * entry_fee_rate, 6)
 
@@ -432,6 +444,71 @@ class PaperTradingEngine:
                 won=won,
                 predicted_prob=trade.model_probability,
                 actual=actual,
+            )
+
+        return trade
+
+    def early_exit_trade(
+        self,
+        trade_id: int,
+        current_market_price: float,
+        closed_at: Optional[str] = None,
+    ) -> PaperTrade:
+        """Exit a trade early at current market price (stop-loss or take-profit).
+
+        Instead of waiting for binary resolution (0/1), sells shares at the
+        current market probability price.
+        """
+        if trade_id not in self.open_trades:
+            raise KeyError(f"open trade not found: {trade_id}")
+
+        trade = self.open_trades.pop(trade_id)
+
+        # For YES contracts, exit_price = current market price
+        # For NO contracts, exit_price = 1 - current market price
+        if trade.contract_side == "YES":
+            exit_price = max(0.001, min(0.999, current_market_price))
+        else:
+            exit_price = max(0.001, min(0.999, 1.0 - current_market_price))
+
+        exit_fee_rate = self.fill_simulator.exit_fee_rate(exit_price)
+
+        # Payout = shares * exit_price (selling at market, not binary resolution)
+        payout_usdc = round(trade.shares * exit_price, 6)
+        exit_fee_usdc = round(payout_usdc * exit_fee_rate, 6)
+        pnl_usdc = round(
+            payout_usdc - exit_fee_usdc - trade.size_usdc - trade.entry_fee_usdc, 6
+        )
+        return_pct = round((pnl_usdc / trade.size_usdc) if trade.size_usdc > 0 else 0.0, 6)
+        won = pnl_usdc > 0
+
+        trade.closed_at = closed_at or _utc_now_iso()
+        trade.status = "CLOSED"
+        trade.exit_price = exit_price
+        trade.exit_fee_usdc = exit_fee_usdc
+        trade.payout_usdc = payout_usdc
+        trade.pnl_usdc = pnl_usdc
+        trade.return_pct = return_pct
+        trade.won = won
+        trade.resolution_outcome_up = None  # not resolved via event
+        trade.reason = f"early_exit|{trade.reason}"
+
+        self.cash_usdc = round(self.cash_usdc + payout_usdc - exit_fee_usdc, 6)
+        self.closed_trades.append(trade)
+        self._append_equity_point()
+
+        close_day_key = _utc_day_key_from_epoch(_parse_iso_to_epoch(trade.closed_at))
+        self._ensure_day_tracking(close_day_key)
+        self._daily_realized_pnl[close_day_key] = round(
+            self._daily_realized_pnl.get(close_day_key, 0.0) + pnl_usdc,
+            6,
+        )
+
+        if self.risk_manager is not None:
+            self.risk_manager.record_outcome(
+                won=won,
+                predicted_prob=trade.model_probability,
+                actual=exit_price if trade.contract_side == "YES" else 1.0 - exit_price,
             )
 
         return trade
